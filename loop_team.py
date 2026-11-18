@@ -166,9 +166,7 @@ MAX_TOOL_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
 # Ограничиваем один аргумент записи с запасом до Handoff, чтобы содержимое файла
 # вместе с историей не могло в одиночку съесть всё окно модели.
-MAX_FILE_WRITE_CHARS = max(1, min(200000, int(
-    getattr(team_config, "HANDOFF_TOKEN_LIMIT", 24576)
-)))
+MAX_FILE_WRITE_CHARS = 200000
 MAX_LIST_ENTRIES = 200
 MAX_FEEDBACK_CHARS = 6000
 HANDOFF_SUMMARY_CHARS = 4000
@@ -343,6 +341,20 @@ def _max_attempts() -> int:
     return attempts if attempts >= 1 else 3
 
 
+def _remaining_file_write_limit(messages: list) -> int:
+    """Предел записи с учётом текущего запаса до Handoff (символы)."""
+    try:
+        handoff_limit = max(1, int(getattr(team_config, "HANDOFF_TOKEN_LIMIT", 24576)))
+        divisor = max(1, int(getattr(team_config, "TOKEN_ESTIMATE_DIVISOR", 3)))
+        used_tokens = team_config.extract_used_tokens(None, messages)
+    except Exception:
+        # Без достоверной оценки токенов не сужаем символный лимит: общий порог
+        # Handoff проверяется отдельно перед каждым следующим запросом к модели.
+        return MAX_FILE_WRITE_CHARS
+    remaining_tokens = max(0, handoff_limit - used_tokens)
+    return min(MAX_FILE_WRITE_CHARS, remaining_tokens * divisor)
+
+
 def _handoff_file_path() -> Path:
     """Текущий путь к handoff.md (читается из team_config в момент вызова)."""
     raw = getattr(team_config, "HANDOFF_FILE", None)
@@ -429,7 +441,8 @@ def _tool_read_file(arguments: dict) -> str:
     return _truncate(text, MAX_FILE_READ_CHARS)
 
 
-def _tool_write_file(arguments: dict, touched_files: list) -> str:
+def _tool_write_file(arguments: dict, touched_files: list,
+                     max_chars: int = MAX_FILE_WRITE_CHARS) -> str:
     """Инструмент write_file: запись файла целиком в UTF-8 внутри папки проекта."""
     path, error = _safe_project_path(arguments.get("path"))
     if path is None:
@@ -442,10 +455,12 @@ def _tool_write_file(arguments: dict, touched_files: list) -> str:
             "содержимое файла целиком, без заглушек."
         )
     text = _as_text(content)
-    if len(text) > MAX_FILE_WRITE_CHARS:
+    safe_max_chars = max(0, min(MAX_FILE_WRITE_CHARS, int(max_chars)))
+    if len(text) > safe_max_chars:
         return (
             f"Слишком большое содержимое ({len(text)} символов, максимум "
-            f"{MAX_FILE_WRITE_CHARS}). Разбей файл на части или сократи его."
+            f"{safe_max_chars} с учётом текущего запаса контекста). "
+            "Сократи файл или дождись переноса состояния через Handoff."
         )
 
     try:
@@ -520,7 +535,8 @@ def _parse_arguments(raw) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _execute_tool_call(name: str, raw_arguments, touched_files: list) -> str:
+def _execute_tool_call(name: str, raw_arguments, touched_files: list,
+                       max_file_write_chars: int = MAX_FILE_WRITE_CHARS) -> str:
     """Выполняет один вызов инструмента и всегда возвращает текст для модели.
 
     Любая ошибка превращается в русское сообщение: исключение разорвало бы
@@ -531,7 +547,7 @@ def _execute_tool_call(name: str, raw_arguments, touched_files: list) -> str:
         if name == "read_file":
             return _tool_read_file(arguments)
         if name == "write_file":
-            return _tool_write_file(arguments, touched_files)
+            return _tool_write_file(arguments, touched_files, max_file_write_chars)
         if name == "list_files":
             return _tool_list_files(arguments)
         return (
@@ -749,6 +765,14 @@ def _run_executor(messages: list, step_message: str,
 
     for _round_index in range(MAX_TOOL_ROUNDS):
         response, error, _code = _call_local_model(messages, TOOL_DEFINITIONS)
+        # Ответ мог довести диалог до порога. Не исполняем его новые файловые
+        # вызовы; сначала фиксируем фактическое состояние уже записанных артефактов.
+        if team_config.is_context_critical(
+            team_config.extract_used_tokens(response, messages)
+        ):
+            return ("Контекст достиг порога Handoff после ответа модели; "
+                    "новые вызовы инструментов не выполнялись.", response)
+        write_budget = _remaining_file_write_limit(messages)
 
         if error:
             # HTTP-ошибка может означать переполнение контекста или сбой запроса,
@@ -775,7 +799,12 @@ def _run_executor(messages: list, step_message: str,
                 function = {}
             call_id = _as_text(call.get("id")).strip() or f"call_{call_index}"
             name = _as_text(function.get("name")).strip()
-            result = _execute_tool_call(name, function.get("arguments"), touched_files)
+            result = _execute_tool_call(
+                name, function.get("arguments"), touched_files, write_budget
+            )
+            if name == "write_file" and result.startswith("Файл записан:"):
+                arguments = _parse_arguments(function.get("arguments"))
+                write_budget = max(0, write_budget - len(_as_text(arguments.get("content"))))
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -888,7 +917,7 @@ def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list
 # Публичная функция Шага 5: главный цикл
 # ---------------------------------------------------------------------------
 
-def run_team_loop(task: str = "") -> dict:
+def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
     """Запускает полный цикл: план -> (Исполнитель <-> Ревьюер) по каждому шагу.
 
     Аргумент: task — текст задачи пользователя. При продолжении работы из
@@ -906,7 +935,9 @@ def run_team_loop(task: str = "") -> dict:
     task_text = _as_text(task).strip()
 
     # СТАРТ: Аналитик (ШАГ 4). handoff_text — содержимое handoff.md, если он был.
-    steps, handoff_text, plan_tokens = analyst_planner.build_execution_plan(task_text)
+    steps, handoff_text, plan_tokens = analyst_planner.build_execution_plan(
+        task_text, resume_backup=resume_backup
+    )
     if not task_text and handoff_text:
         # При возобновлении исходные требования берём из сохранённого раздела,
         # чтобы последующий handoff не заменил их сообщением о пустом аргументе.
@@ -985,12 +1016,26 @@ def run_team_loop(task: str = "") -> dict:
                 # 3. Обновление current_tokens по реальному ответу сервера.
                 current_tokens = team_config.extract_used_tokens(response, messages)
                 if team_config.is_context_critical(current_tokens):
+                    objective_report = isolated_reviewer.run_objective_checks(
+                        touched_files
+                    )
+                    verified_files = (
+                        "Файлы Исполнителя проверены: " + ", ".join(
+                            _relative_display(path) for path in touched_files
+                        )
+                        if touched_files else
+                        "Исполнитель не передал ни одного пути к файлу; "
+                        "проверяемых артефактов нет."
+                    )
                     return _stop_for_handoff(
                         task_text, steps, step_idx, messages,
                         (
                             f"Контекст достиг порога Handoff внутри попытки: "
                             f"{current_tokens} токенов; остановка перед следующим "
-                            "вызовом модели."
+                            "вызовом модели. Объективная проверка файлового состояния "
+                            f"перед остановкой: {verified_files} {objective_report}. "
+                            "Отчёт Исполнителя перед остановкой: "
+                            f"{_truncate(report, MAX_FEEDBACK_CHARS)}"
                         ),
                         "context_handoff", current_tokens,
                     )
@@ -1255,10 +1300,14 @@ def main() -> int:
         print("\n[ОШИБКА] проверка инструментов не пройдена — цикл не запускается.")
         return 1
 
-    # Полноценный командный интерфейс (флаги --resume и --test-handoff) делается
-    # в Шаге 6. Здесь задача берётся одной строкой из аргументов, чтобы можно было
-    # проверить цикл на своей задаче прямо сейчас.
-    task = " ".join(sys.argv[1:]).strip() or DEMO_TASK
+    # --resume — явный запрос продолжить из резервного handoff.bak. Без флага
+    # старый .bak не должен перехватывать новую или демонстрационную задачу.
+    arguments = sys.argv[1:]
+    resume_backup = arguments == ["--resume"]
+    if "--resume" in arguments and not resume_backup:
+        print("[ОШИБКА] используйте --resume отдельно, без текста новой задачи.")
+        return 2
+    task = "" if resume_backup else (" ".join(arguments).strip() or DEMO_TASK)
 
     print("\n" + "=" * 62)
     print("ЗАПУСК ЦИКЛА ПО ЛОКАЛЬНОЙ МОДЕЛИ")
@@ -1269,7 +1318,7 @@ def main() -> int:
     print(f"Задача: {_truncate(task, 300)}")
 
     try:
-        result = run_team_loop(task)
+        result = run_team_loop(task, resume_backup=resume_backup)
     except KeyboardInterrupt:
         print("\n[ПРЕРВАНО] работа остановлена клавишей Ctrl+C.")
         print("Новый handoff не создан. Если был загружен handoff, исходная точка остаётся в handoff.bak.")

@@ -769,7 +769,7 @@ def _handoff_file_path() -> Path:
     return path
 
 
-def _load_handoff() -> "str | None":
+def _load_handoff(include_backup: bool = False) -> "str | None":
     """Забирает handoff у Шага 3. Ошибка чтения не должна останавливать Аналитика."""
     loader = getattr(handoff_manager, "load_handoff_if_exists", None)
     if not callable(loader):
@@ -777,7 +777,19 @@ def _load_handoff() -> "str | None":
               "работаю без handoff.")
         return None
     try:
-        text = loader()
+        text = loader(include_backup=include_backup)
+    except TypeError:
+        # Совместимость с уже подключёнными реализациями и заглушками без нового
+        # необязательного параметра: резервный файл в таком случае не запрашиваем.
+        if include_backup:
+            _warn("менеджер handoff не поддерживает явное чтение .bak.")
+            return None
+        try:
+            text = loader()
+        except Exception as exc:
+            _warn(f"не удалось прочитать handoff.md: {type(exc).__name__}: {exc}. "
+                  "Работаю без handoff.")
+            return None
     except Exception as exc:
         _warn(f"не удалось прочитать handoff.md: {type(exc).__name__}: {exc}. "
               "Работаю без handoff.")
@@ -860,13 +872,14 @@ def _degraded_plan(user_task: str, handoff_text: "str | None") -> list[str]:
 # Публичная функция Шага 4
 # ---------------------------------------------------------------------------
 
-def build_execution_plan(user_task: str = "") -> tuple[list[str], "str | None", int]:
+def build_execution_plan(
+    user_task: str = "", *, resume_backup: bool = False
+) -> tuple[list[str], "str | None", int]:
     """Составляет план работы: список шагов, handoff и потраченные токены.
 
     Аргументы:
-      user_task — текст задачи пользователя. При возобновлении работы из handoff
-                  (флаг --resume в Шаге 6) задача не нужна, поэтому аргумент
-                  допустимо оставить пустым.
+      user_task      — текст задачи пользователя;
+      resume_backup  — разрешает читать handoff.bak только при явном возобновлении.
 
     Возвращает кортеж (steps, handoff_text, tokens):
       steps        — список шагов list[str], всегда непустой;
@@ -887,12 +900,20 @@ def build_execution_plan(user_task: str = "") -> tuple[list[str], "str | None", 
     handoff_text = None
     tokens = 0
     plan_built = False
+    handoff_from_backup = False
 
     # С момента загрузки handoff любой неуспешный выход обязан вернуть файл.
     # finally покрывает и незапланированные исключения, и KeyboardInterrupt /
     # SystemExit; последние намеренно не поглощаем обработчиком Exception.
     try:
-        handoff_text = _load_handoff()
+        if resume_backup:
+            try:
+                handoff_from_backup = not _handoff_file_path().is_file()
+            except OSError:
+                # При ошибке проверки считаем источник первичным, чтобы не потерять
+                # текст, если ниже он всё же будет прочитан.
+                handoff_from_backup = False
+        handoff_text = _load_handoff(include_backup=resume_backup)
         if not task and handoff_text is None:
             # Запрашивать у модели план для пустоты бессмысленно: получили бы
             # пять минут ожидания и мусор вместо плана.
@@ -958,8 +979,11 @@ def build_execution_plan(user_task: str = "") -> tuple[list[str], "str | None", 
         )
         return (_degraded_plan(task, handoff_text), handoff_text, tokens)
     finally:
-        if not plan_built:
-            _restore_handoff_after_failure(handoff_text)
+        if not plan_built and handoff_text:
+            if handoff_from_backup:
+                _warn("план не построен; исходный handoff.bak сохранён без изменений.")
+            else:
+                _restore_handoff_after_failure(handoff_text)
 
 
 # ---------------------------------------------------------------------------

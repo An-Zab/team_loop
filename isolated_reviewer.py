@@ -553,23 +553,6 @@ def review_step(step_goal: str, executor_report: str, modified_files: list[str] 
     report = _as_text(executor_report)
     checks = _collect_objective_checks(modified_files)
 
-    # Не разрешаем принять файловый шаг только по убедительному текстовому отчёту:
-    # такие шаги обязаны оставить проверяемые файлы на диске.
-    file_required = bool(re.search(
-        r"(?:созда|записа|сохрани|измени|обнови|добави|реализу|напиши|файл|модул|скрипт|код)",
-        goal.lower(),
-    ))
-    if file_required and not checks["py_ok"] and not checks["other_files"]:
-        return {
-            "accepted": False,
-            "feedback": (
-                "Шаг требует файлового результата, но ни одного проверяемого файла "
-                "не было передано или найдено на диске. Используй инструмент "
-                "write_file, затем повтори проверку."
-            ),
-            "review_tokens": 0,
-        }
-
     # Синтаксическая ошибка — вердикт сразу, модель не вызываем (требование ТЗ):
     # незачем тратить токены и время на оценку кода, который даже не компилируется.
     if checks["syntax_errors"]:
@@ -601,6 +584,22 @@ def review_step(step_goal: str, executor_report: str, modified_files: list[str] 
                 "Шаг не принят: указанные исполнителем файлы не найдены на диске:\n"
                 f"{listed}\n\n"
                 "Создай или сохрани эти файлы по указанным путям, затем повтори шаг."
+            ),
+            "review_tokens": 0,
+        }
+
+    # Только если Исполнитель вообще не передал путей: результаты компиляции и
+    # точные ошибки выше должны сохранять приоритет и диагностическую точность.
+    file_required = bool(re.search(
+        r"(?:созда|записа|сохрани|измени|обнови|добави|реализу|напиши|файл|модул|скрипт|код)",
+        goal.lower(),
+    ))
+    if file_required and not _normalize_file_paths(modified_files):
+        return {
+            "accepted": False,
+            "feedback": (
+                "Шаг требует файлового результата, но Исполнитель не передал ни одного "
+                "пути к файлу. Используй write_file и передай путь для проверки."
             ),
             "review_tokens": 0,
         }

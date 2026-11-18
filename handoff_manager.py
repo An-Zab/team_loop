@@ -1149,11 +1149,12 @@ def _archive_handoff(path: Path) -> bool:
     return False
 
 
-def load_handoff_if_exists() -> "str | None":
+def load_handoff_if_exists(include_backup: bool = False) -> "str | None":
     """Читает handoff.md и убирает его с дороги (ШАГ 3, п.2).
 
-    Если handoff.md есть — читает и переносит его в handoff.bak. Если его нет,
-    резервный handoff.bak читается как точка восстановления после прерывания.
+    Резервный handoff.bak читается только при явном запросе возобновления.
+    Обычный запуск без handoff.md возвращает None, чтобы старое состояние не
+    перехватывало новые задачи.
     """
     path = _handoff_file_path()
     try:
@@ -1164,8 +1165,8 @@ def load_handoff_if_exists() -> "str | None":
         return None
 
     if not exists:
-        # После успешного планирования исходный файл хранится в .bak как точка
-        # восстановления; прерывание выполнения не должно делать её невидимой.
+        if not include_backup:
+            return None
         backup = _backup_file_path()
         try:
             if backup.is_file():
@@ -1382,7 +1383,7 @@ def _self_check() -> bool:
         ok = ok and (not still_there) and backup_path.is_file()
 
         print("\nШАГ ДЕМОНСТРАЦИИ 3. Повторная загрузка из резервного файла:")
-        again = load_handoff_if_exists()
+        again = load_handoff_if_exists(include_backup=True)
         resumed = again is not None and again.strip() == document.strip()
         print(f"  handoff.bak доступен для продолжения: [{'OK' if resumed else 'ОШИБКА'}]")
         ok = ok and resumed
