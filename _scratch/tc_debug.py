@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-SRC = Path(r"F:\Projects\team_loop\team_config.py")
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "team_config.py").resolve()
 
 DRIVER = '''
 import json, os, sys

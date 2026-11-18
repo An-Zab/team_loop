@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-path = Path(sys.argv[1] if len(sys.argv) > 1 else r"F:\Projects\team_loop\team_config.py")
+path = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "team_config.py").resolve()
 src = path.read_text(encoding="utf-8")
 tree = ast.parse(src)
 

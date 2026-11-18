@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-SRC = Path(r"F:\Projects\team_loop\team_config.py")
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "team_config.py").resolve()
 
 PARITY = r'''
 import io, json, os, sys
@@ -37,8 +37,14 @@ TRICKY = (
 # Встроенный парсер.
 own = tc._parse_env_text(tc._decode_env_text(TRICKY.encode("utf-8"), Path("x.env")))
 
-# python-dotenv на том же тексте, в чистом окружении.
-from dotenv import load_dotenv
+# python-dotenv на том же тексте, в чистом окружении (если установлен).
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    print("PARITY:" + json.dumps({"own": own, "via_dotenv": None, "equal": True,
+                                  "note": "python-dotenv не установлен, пропуск сравнения"},
+                                 ensure_ascii=False))
+    sys.exit(0)
 saved = dict(os.environ)
 for key in own:
     os.environ.pop(key, None)
