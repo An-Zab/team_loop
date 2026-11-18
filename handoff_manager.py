@@ -28,6 +28,13 @@ handoff_manager.py — ШАГ 3: менеджер Handoff (сохранение 
 (текст задачи, план с отметками, причина остановки, последние сообщения). Так запуск
 с переполненным контекстом не оставляет человека без точки продолжения.
 
+Второй принцип: модель не имеет права тихо испортить исходные данные. Непустой раздел
+ещё не значит достоверный, поэтому перед записью в файл ответ модели сверяется с тем,
+что программа знает точно: полным текстом задачи и планом с отметками. Сокращённую или
+пересказанную задачу, пропущенный шаг и отмеченный выполненным текущий шаг программа
+подменяет достоверными данными и помечает раздел словами «исправлен программой
+автоматически».
+
 Совместимость с Windows и защита от падения (правило 2 PLAN.md):
   * pathlib.Path для путей, явный encoding="utf-8" при записи и чтении;
   * пути handoff.md и handoff.bak читаются из team_config в момент вызова, поэтому
@@ -36,12 +43,15 @@ handoff_manager.py — ШАГ 3: менеджер Handoff (сохранение 
     любая сетевая ошибка превращается в понятное русское сообщение, а не в traceback;
   * в промпт попадает только хвост истории и только обрезанный по длине текст: запрос
     сжатия сам идёт в ту же модель с тем же окном контекста и не должен его переполнить;
+    обрезка касается ТОЛЬКО промпта — в handoff.md текст задачи пишется целиком, иначе
+    требования, не влезшие в окно, восстановить было бы неоткуда;
   * UTF-8 включается в stdout/stderr только в точке входа (if __name__ == "__main__":),
     при импорте модуля потоки процесса хоста не меняются.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 from pathlib import Path
@@ -127,6 +137,11 @@ MAX_ERROR_CHARS = 4000
 # что часть разделов заполнена не моделью, а программой из реальных данных.
 AUTO_ASSEMBLED_MARK = "собрана программой автоматически"
 AUTO_ASSEMBLED_NOTE = f"Часть текста {AUTO_ASSEMBLED_MARK} из известных программе данных."
+
+# Пометка в разделе, который программа подменила достоверными данными после сверки
+# ответа модели с исходными сведениями: раздел был формально заполнен, но содержал
+# сокращённую задачу, пропущенный шаг или неверную отметку [x]/[ ].
+AUTO_CORRECTED_MARK = "исправлен программой автоматически"
 
 # Нормализация заголовка: оставляет только буквы и цифры (кириллица, латиница) и
 # переводит в нижний регистр. Так «## Статус плана», «**Статус плана:**» и
@@ -371,7 +386,13 @@ def _messages_to_text(recent_messages) -> str:
 
 def _build_handoff_messages(task: str, steps: list[str], step_idx: int,
                             messages_text: str, blocker: str) -> list:
-    """Собирает запрос к модели: system с шаблоном + user с фактическими данными."""
+    """Собирает запрос к модели: system с шаблоном + user с фактическими данными.
+
+    Сюда передают ПОЛНЫЙ текст задачи, а в промпт он уходит обрезанным по
+    MAX_TASK_CHARS: запрос сжатия идёт в ту же модель с тем же окном контекста,
+    которое уже переполнено. Ограничение размера живёт здесь и касается только
+    промпта — в handoff.md задача пишется целиком (см. _build_fallback_sections).
+    """
     plan_lines = []
     for idx, step in enumerate(steps):
         if idx < step_idx:
@@ -582,13 +603,284 @@ def _format_plan_checklist(steps: list[str], step_idx: int) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Сверка разделов модели с исходными данными
+# ---------------------------------------------------------------------------
+
+# Строка списка — кандидат в пункты плана. Без этого признака вступительная проза
+# модели («Ниже статус плана:») посчиталась бы лишним шагом и раздел заменился бы
+# без реальной необходимости.
+_LIST_PREFIX_RE = re.compile(
+    r"^\s*(?:[-*+\u2022]|\d+[.)]|\[[^\]]*\]|шаг[\s\u2116#:]*\d+)", re.IGNORECASE
+)
+
+# Отметка пункта в квадратных скобках: [x], [ ], [выполнен], [ТЕКУЩИЙ].
+_CHECK_RE = re.compile(r"\[\s*([^\]\r\n]*)\s*\]")
+
+# Что внутри скобок означает «шаг сделан». Пустая скобка — «не сделан».
+_DONE_BOX_MARKS = frozenset(
+    {"x", "х", "✓", "✔", "*", "done", "выполнено", "выполнен", "готово", "сделано"}
+)
+
+# Слова-и-символы статусов, когда модель отметку скобкой не ставила. Отрицания
+# проверяются первыми: во «не выполнен» уже есть слово «выполнен».
+_DONE_WORDS = ("выполнен", "заверш", "сделано", "готово", "done", "complete",
+               "accepted", "✅", "✔", "☑")
+_PENDING_WORDS = ("не выполнен", "не заверш", "не сделан", "не начат", "не готов",
+                  "в процессе", "текущ", "pending", "todo", "current", "⬜", "❌")
+
+# Порог похожести текста шага (0..1), при котором пункт ещё считается тем же
+# самым шагом, а не выдуманным. Ниже — уже расхождение, которое надо исправлять.
+_STEP_MATCH_RATIO = 0.6
+
+
+def _heading_title(heading: str) -> str:
+    """Название раздела без решётки: «# Статус плана» -> «Статус плана»."""
+    return _as_text(heading).lstrip("#").strip()
+
+
+def _skeleton(text) -> str:
+    """Только буквы и цифры нижним регистром — устойчивая сверка фрагментов текста.
+
+    Пробелы, звёздочки Markdown, кавычки-«ёлочки», дефисы и нумерацию модель меняет
+    свободно, а смысл шага или задачи от этого не меняется. Сверяем «скелет» текста,
+    чтобы не ругать на косметику и не пропустить настоящую подмену слов.
+    """
+    return _HEADING_CLEAN_RE.sub("", _as_text(text)).lower()
+
+
+def _correction_note(heading: str, problems: list) -> str:
+    """Пометка в начале исправленного раздела: что не так и откуда взят текст."""
+    return (
+        f"Примечание: раздел «{_heading_title(heading)}» {AUTO_CORRECTED_MARK}: "
+        + "; ".join(problems)
+        + ". Ниже — достоверные исходные данные, а не пересказ модели."
+    )
+
+
+def _corrected_section(heading: str, problems: list, body: str) -> str:
+    """Собирает исправленный раздел: пометка вверху, достоверный текст ниже."""
+    return f"{_correction_note(heading, problems)}\n\n{body}"
+
+
+def _item_mark(has_box: bool, status: str, text: str):
+    """Отметка пункта плана: True — выполнен, False — нет, None — отметки нет.
+
+    Скобка надёжнее слов, но локальные модели пишут и «[выполнен]», и «готово»,
+    и галочку без скобок, поэтому слова и символы тоже смотрим. Отрицания («не
+    выполнен», «текущий») проверяем первыми: в них уже есть слово «выполнен».
+    """
+    mark = _as_text(status).strip().lower()
+    if has_box and not mark:
+        return False
+    if mark in _DONE_BOX_MARKS:
+        return True
+    probe = f"{text} {mark}".lower()
+    if any(word in probe for word in _PENDING_WORDS):
+        return False
+    if any(word in probe for word in _DONE_WORDS):
+        return True
+    return None
+
+
+def _checklist_items(section: str) -> list:
+    """Разбирает раздел «Статус плана» на пункты: пары (текст, отметка или None).
+
+    Пунктом считается строка списка, нумерованная строка, строка со словом «Шаг N»
+    или с квадратной скобкой. Вступительная проза модели пунктом не считается.
+    """
+    items = []
+    for line in _as_text(section).splitlines():
+        if not line.strip():
+            continue
+        if _LIST_PREFIX_RE.match(line) is None and _CHECK_RE.search(line) is None:
+            continue
+        match = _CHECK_RE.search(line)
+        status = match.group(1).strip() if match else ""
+        text = (line[:match.start()] + " " + line[match.end():]) if match else line
+        items.append((text.strip(), _item_mark(match is not None, status, text)))
+    return items
+
+
+def _match_steps_and_items(steps: list, items: list) -> tuple:
+    """Сопоставляет шаги плана с пунктами раздела, чтобы проверить отметки.
+
+    Порядок строк модель может менять, поэтому ищем не по позиции, а по тексту:
+    сначала точное совпадение «скелета», затем вхождение, затем похожий текст
+    (модель могла перефразировать шаг). Возвращает тройку: соответствие шаг->пункт,
+    номера пропущенных шагов, номера лишних пунктов.
+    """
+    step_keys = [_skeleton(step) for step in steps]
+    item_keys = [_skeleton(text) for text, _ in items]
+
+    matched: dict = {}
+    used: set = set()
+
+    # 1-й проход: точное совпадение, 2-й: пункт содержит шаг или шаг содержит пункт.
+    for pass_no in (1, 2):
+        for s_idx, key in enumerate(step_keys):
+            if s_idx in matched or not key:
+                continue
+            for i_idx, item_key in enumerate(item_keys):
+                if i_idx in used or not item_key:
+                    continue
+                exact = item_key == key
+                inside = key in item_key or item_key in key
+                if exact or (pass_no == 2 and inside):
+                    matched[s_idx] = i_idx
+                    used.add(i_idx)
+                    break
+
+    # 3-й проход: похожий текст, если модель перефразировала шаг своими словами.
+    for s_idx, key in enumerate(step_keys):
+        if s_idx in matched or not key:
+            continue
+        best_idx = None
+        best_ratio = 0.0
+        for i_idx, item_key in enumerate(item_keys):
+            if i_idx in used or not item_key:
+                continue
+            ratio = difflib.SequenceMatcher(None, key, item_key).ratio()
+            if ratio > best_ratio:
+                best_idx, best_ratio = i_idx, ratio
+        if best_idx is not None and best_ratio >= _STEP_MATCH_RATIO:
+            matched[s_idx] = best_idx
+            used.add(best_idx)
+
+    missing = [idx for idx in range(len(steps)) if idx not in matched]
+    extra = [idx for idx in range(len(items)) if idx not in used]
+    return matched, missing, extra
+
+
+def _verify_task_section(model_section: str, task_full: str) -> tuple:
+    """Сверяет раздел «Исходная задача» с настоящим текстом задачи.
+
+    Возвращает пару (текст_раздела, список_замечаний). Замечаний нет — модель вернула
+    задачу без потерь, оставляем её текст. Иначе раздел заменяется полным исходным
+    текстом: программа знает задачу дословно, а потерянное условие в новом чате
+    восстановить будет неоткуда.
+    """
+    if not task_full or not _as_text(model_section).strip():
+        # Сверять не с чем (задача не передана) либо раздел пуст — его заполнит
+        # резервный текст из реальных данных ниже.
+        return model_section, []
+
+    truth = _skeleton(task_full)
+    got = _skeleton(model_section)
+    if not got or got == truth:
+        return model_section, []
+
+    if truth.startswith(got):
+        problem = (f"модель вернула задачу не полностью, сокращено ~"
+                   f"{len(truth) - len(got)} знаков")
+    elif got in truth:
+        problem = (f"модель вернула только часть задачи, не хватает ~"
+                   f"{len(truth) - len(got)} знаков")
+    elif truth in got:
+        problem = "модель добавила к задаче посторонний текст"
+    else:
+        problem = "модель пересказала задачу и изменила её формулировку"
+    return _corrected_section(HANDOFF_HEADINGS[0], [problem], task_full), [problem]
+
+
+def _verify_plan_section(model_section: str, steps: list, step_idx: int) -> tuple:
+    """Сверяет раздел «Статус плана» с настоящим планом и индексом текущего шага.
+
+    Проверяет три вещи: все ли шаги на месте, не придумала ли модель лишних и
+    правильные ли отметки [x]/[ ]. Главная опасность — отмеченный выполненным текущий
+    шаг: новый чат тогда пропустит незавершённую работу. Возвращает пару
+    (текст_раздела, список_замечаний); при замечаниях раздел пересобирается из плана.
+    """
+    items = _checklist_items(model_section)
+
+    if not steps:
+        if not items:
+            return model_section, []
+        problem = "список шагов пуст, а модель перечислила шаги"
+        return (_corrected_section(HANDOFF_HEADINGS[1], [problem],
+                                   _format_plan_checklist(steps, step_idx)),
+                [problem])
+
+    if not items:
+        problem = "модель не вернула ни одного пункта списка шагов"
+        return (_corrected_section(HANDOFF_HEADINGS[1], [problem],
+                                   _format_plan_checklist(steps, step_idx)),
+                [problem])
+
+    matched, missing_steps, extra_items = _match_steps_and_items(steps, items)
+    problems = []
+    if missing_steps:
+        problems.append("модель пропустила шаг(и) из плана: "
+                        + ", ".join(str(idx + 1) for idx in missing_steps))
+    if extra_items:
+        problems.append("модель добавила шаги, которых нет в плане: "
+                        + ", ".join(str(idx + 1) for idx in extra_items))
+
+    for s_idx, i_idx in matched.items():
+        _text, checked = items[i_idx]
+        expected_done = s_idx < step_idx
+        if checked is None:
+            problems.append(f"у шага {s_idx + 1} нет отметки [x] или [ ]")
+        elif checked == expected_done:
+            continue
+        elif s_idx == step_idx:
+            problems.append(f"текущий шаг {s_idx + 1} помечен выполненным")
+        elif expected_done:
+            problems.append(f"выполненный шаг {s_idx + 1} помечен невыполненным")
+        else:
+            problems.append(f"шаг {s_idx + 1} ещё не выполнен, но помечен выполненным")
+
+    if not problems:
+        return model_section, []
+    return (_corrected_section(HANDOFF_HEADINGS[1], problems,
+                               _format_plan_checklist(steps, step_idx)),
+            problems)
+
+
+def _verify_model_sections(sections: dict, task_full: str, steps: list,
+                           step_idx: int) -> list:
+    """Сверяет разделы модели с исходными данными и исправляет их на месте.
+
+    Проверка нужна, потому что непустой раздел ещё не значит достоверный: модель
+    может сократить задачу, пропустить шаг плана или отметить выполненным текущий
+    шаг. Программа эти данные знает точно, поэтому подменяет спорный раздел
+    достоверным текстом и сообщает о каждом исправлении в stderr.
+
+    Разделы, пришедшие не из ответа модели (их собрал _build_fallback_sections),
+    сюда не попадают: они и так собраны из исходных данных.
+    """
+    problems: list = []
+
+    task_section = _as_text(sections.get(HANDOFF_HEADINGS[0]))
+    if task_section.strip():
+        fixed, found = _verify_task_section(task_section, task_full)
+        if found:
+            sections[HANDOFF_HEADINGS[0]] = fixed
+            problems.extend(f"«{_heading_title(HANDOFF_HEADINGS[0])}»: {text}"
+                            for text in found)
+
+    plan_section = _as_text(sections.get(HANDOFF_HEADINGS[1]))
+    if plan_section.strip():
+        fixed, found = _verify_plan_section(plan_section, steps, step_idx)
+        if found:
+            sections[HANDOFF_HEADINGS[1]] = fixed
+            problems.extend(f"«{_heading_title(HANDOFF_HEADINGS[1])}»: {text}"
+                            for text in found)
+
+    if problems:
+        _warn("Разделы модели сверены с исходными данными; исправлено: "
+              + "; ".join(problems))
+    return problems
+
+
 def _build_fallback_sections(task: str, steps: list[str], step_idx: int,
                              messages_text: str, blocker: str,
                              model_error: str) -> dict:
     """Резервное содержимое разделов из реальных данных, когда модель не помогла.
 
     Разделы «Исходная задача» и «Статус плана» программа знает сама и точнее, чем
-    модель: задача передаётся дословно, а отметки [x]/[ ] выводятся из индекса шага.
+    модель: задача передаётся дословно и целиком, а отметки [x]/[ ] выводятся из
+    индекса шага.
     """
     note_lines = []
     if model_error:
@@ -620,7 +912,11 @@ def _build_fallback_sections(task: str, steps: list[str], step_idx: int,
     )
 
     return {
-        HANDOFF_HEADINGS[0]: _truncate(task, MAX_TASK_CHARS).strip()
+        # Полный текст задачи, без обрезки по MAX_TASK_CHARS: handoff.md — это
+        # состояние работы на диске, а не запрос модели. Обрезка нужна только чтобы
+        # не переполнить окно модели, а потерянные здесь требования новый чат уже бы
+        # не восстановил — он видит только этот файл.
+        HANDOFF_HEADINGS[0]: _as_text(task).strip()
         or "Текст исходной задачи не передан — уточни его у пользователя.",
         HANDOFF_HEADINGS[1]: _format_plan_checklist(steps, step_idx),
         HANDOFF_HEADINGS[2]: (
@@ -693,7 +989,8 @@ def generate_handoff(task: str, plan: list[str], current_step_idx: int,
     """Сохраняет состояние работы в handoff.md (ШАГ 3, п.1).
 
     Аргументы:
-      task              — текст исходной задачи (попадает в раздел 1 без потерь);
+      task              — текст исходной задачи: в handoff.md попадает целиком,
+                          в промпт модели — обрезанным по MAX_TASK_CHARS;
       plan              — список шагов плана;
       current_step_idx  — индекс текущего (незавершённого) шага, с нуля;
       recent_messages   — последние сообщения основного чата (обрезаются);
@@ -705,14 +1002,23 @@ def generate_handoff(task: str, plan: list[str], current_step_idx: int,
     Модель вызывается один раз коротким stateless-запросом (правило 3 PLAN.md). Если она
     недоступна или ответ не соответствует шаблону, файл всё равно создаётся: пустые
     разделы заполняются резервным текстом из реальных данных.
+
+    Формально заполненный раздел ещё не значит достоверный, поэтому ответ модели
+    сверяется с исходными данными (_verify_model_sections): сокращённую задачу,
+    пропущенный шаг плана или отмеченный выполненным текущий шаг программа исправляет
+    сама и помечает раздел словами «исправлен программой автоматически».
     """
     steps = _normalize_plan(plan)
     step_idx = _clamp_step_index(current_step_idx, len(steps))
-    task_text = _truncate(_as_text(task), MAX_TASK_CHARS).strip()
+    # Полный текст задачи — единственная копия исходных требований: именно она
+    # попадёт в handoff.md. Ограничение по длине нужно только промпту (окно контекста
+    # уже переполнено), и применяет его _build_handoff_messages. Раньше задача
+    # обрезалась здесь и искалеченный текст уходил и в модель, и в файл.
+    task_full = _as_text(task).strip()
     blocker = _truncate(_as_text(blocker_reason), MAX_BLOCKER_CHARS).strip()
     messages_text = _messages_to_text(recent_messages)
 
-    prompt = _build_handoff_messages(task_text, steps, step_idx, messages_text, blocker)
+    prompt = _build_handoff_messages(task_full, steps, step_idx, messages_text, blocker)
     response, error = _call_local_model(prompt)
     model_error = _as_text(error)
     model_text = ""
@@ -741,9 +1047,14 @@ def generate_handoff(task: str, plan: list[str], current_step_idx: int,
                 + ", ".join(missing)
                 + " — они заполнены из известных программе данных."
             )
+        # Разделы модели непустые, но их содержание ещё надо сверить с исходными
+        # данными: модель может сократить задачу, пропустить шаг или отметить
+        # выполненным текущий шаг. Исправление автоматическое — без него такой ответ
+        # ушёл бы в handoff.md и новый чат продолжил бы работу по искажённым данным.
+        _verify_model_sections(sections, task_full, steps, step_idx)
 
     fallback = _build_fallback_sections(
-        task_text, steps, step_idx, messages_text, blocker, model_error
+        task_full, steps, step_idx, messages_text, blocker, model_error
     )
     for heading in HANDOFF_HEADINGS:
         if not _as_text(sections.get(heading)).strip():
@@ -909,6 +1220,78 @@ def _print_document(path: Path) -> None:
     print("  ------------------------------------------------")
 
 
+def _verification_demo() -> bool:
+    """Проверка без обращения к модели: полный текст задачи и сверка разделов.
+
+    Демонстрация работает офлайн, поэтому её видно и с выключенным сервером модели,
+    — именно в запасном режиме важнее всего не потерять требования и отметки плана.
+    В stderr намеренно печатаются предупреждения об исправлениях: так и задумано.
+    """
+    print("\nПРОВЕРКА БЕЗ МОДЕЛИ. Полный текст задачи и сверка ответа модели:")
+    print("(в stderr появятся предупреждения [handoff_manager] — это проверяемые")
+    print(" исправления, они и есть предмет проверки)")
+    ok = True
+
+    steps = ["Подготовить конфигурацию", "Написать ревьюера",
+             "Написать менеджер Handoff"]
+    step_idx = 2
+    long_task = ("Собрать автономный цикл loop_team с механизмом Handoff. " * 300).strip()
+
+    # 1. Задача длиннее лимита: в файл (резервный раздел) она обязана попасть целиком.
+    fallback = _build_fallback_sections(long_task, steps, step_idx, "",
+                                        "Контекст заполнен.", "")
+    task_section = fallback[HANDOFF_HEADINGS[0]]
+    kept_full = task_section == long_task and "текст обрезан" not in task_section
+    print(f"  задача длиннее лимита ({len(long_task)} > {MAX_TASK_CHARS} символов),")
+    print(f"  в handoff.md она попала целиком        : "
+          f"[{'OK' if kept_full else 'ОШИБКА'}]")
+    ok = ok and kept_full
+
+    # 2. Промпт модели остаётся ограниченным: окно контекста не переполняется.
+    prompt_text = _build_handoff_messages(long_task, steps, step_idx, "",
+                                          "Контекст заполнен.")[1]["content"]
+    prompt_bounded = ("текст обрезан" in prompt_text) and len(prompt_text) < len(long_task)
+    print(f"  в промпт модель задача ушла обрезанной : [{'OK' if prompt_bounded else 'ОШИБКА'}]")
+    ok = ok and prompt_bounded
+
+    # 3. Модель пересказала задачу: раздел заменяется полным исходным текстом.
+    sections = {HANDOFF_HEADINGS[0]: "Собрать цикл loop_team (кратко)."}
+    problems = _verify_model_sections(sections, long_task, steps, step_idx)
+    task_fixed = bool(problems) and sections[HANDOFF_HEADINGS[0]].endswith(long_task)
+    print(f"  пересказанная задача восстановлена     : [{'OK' if task_fixed else 'ОШИБКА'}]")
+    ok = ok and task_fixed
+
+    # 4. Модель отметила выполненным текущий шаг: отметки пересобираются из плана.
+    wrong = "\n".join(f"- [x] Шаг {idx + 1}. {step}" for idx, step in enumerate(steps))
+    sections = {HANDOFF_HEADINGS[1]: wrong}
+    problems = _verify_model_sections(sections, "Задача", steps, step_idx)
+    marks = sections[HANDOFF_HEADINGS[1]]
+    marks_fixed = (bool(problems) and "- [x] Шаг 1." in marks and "- [ ] Шаг 3." in marks
+                   and "текущий шаг 3 помечен выполненным" in marks)
+    print(f"  отметки исправлены (шаг 3 снова [ ])   : [{'OK' if marks_fixed else 'ОШИБКА'}]")
+    ok = ok and marks_fixed
+
+    # 5. Модель пропустила шаг плана: раздел пересобирается со всеми шагами.
+    partial = ("- [x] Шаг 1. Подготовить конфигурацию\n"
+               "- [ ] Шаг 2. Написать ревьюера")
+    sections = {HANDOFF_HEADINGS[1]: partial}
+    problems = _verify_model_sections(sections, "Задача", steps, step_idx)
+    step_added = (bool(problems)
+                  and "Шаг 3. Написать менеджер Handoff" in sections[HANDOFF_HEADINGS[1]])
+    print(f"  пропущенный шаг плана возвращён       : [{'OK' if step_added else 'ОШИБКА'}]")
+    ok = ok and step_added
+
+    # 6. Честный ответ модели править нельзя: ложных срабатываний быть не должно.
+    honest = _format_plan_checklist(steps, step_idx)
+    sections = {HANDOFF_HEADINGS[0]: long_task, HANDOFF_HEADINGS[1]: honest}
+    problems = _verify_model_sections(sections, long_task, steps, step_idx)
+    untouched = not problems and sections[HANDOFF_HEADINGS[1]] == honest
+    print(f"  честный ответ модели не тронут         : [{'OK' if untouched else 'ОШИБКА'}]")
+    ok = ok and untouched
+
+    return ok
+
+
 def _self_check() -> bool:
     """Демонстрация критерия готовности Шага 3: создание handoff.md и его загрузка.
 
@@ -929,7 +1312,8 @@ def _self_check() -> bool:
     print("Вызов модели может занять несколько минут; если сервер выключен,")
     print("файл соберётся автоматически — это штатный запасной режим.")
 
-    ok = True
+    # Сначала проверки, которым модель не нужна: они честны при любом сервере.
+    ok = _verification_demo()
     temp_dir: Path | None = None
     saved_file = getattr(team_config, "HANDOFF_FILE", None)
     saved_backup = getattr(team_config, "HANDOFF_BACKUP", None)
@@ -972,6 +1356,10 @@ def _self_check() -> bool:
         if AUTO_ASSEMBLED_MARK in document:
             print("  [ВНИМАНИЕ] часть разделов собрана автоматически: модель недоступна")
             print("  или ответ не соответствовал шаблону. Это штатный запасной режим.")
+        if AUTO_CORRECTED_MARK in document:
+            print("  [ВНИМАНИЕ] модель исказила задачу или отметки плана — эти разделы")
+            print("  исправлены программой по исходным данным. Продолжать работу")
+            print("  можно по ним: там дословная задача и настоящие отметки [x]/[ ].")
         _print_document(handoff_path)
 
         print("\nШАГ ДЕМОНСТРАЦИИ 2. load_handoff_if_exists() читает и переименовывает:")
