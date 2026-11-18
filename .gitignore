@@ -1,6 +1,3 @@
-# Легаси-реализация на LangChain/LangGraph (заменяется по PLAN.md)
-loop_team.py
-
 # Секреты и локальное окружение
 .env
 __pycache__/
