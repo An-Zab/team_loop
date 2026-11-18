@@ -94,6 +94,13 @@ PY_COMPILE_TIMEOUT_SECONDS = 60
 # медленной, поэтому запас большой, но конечный.
 LLM_TIMEOUT_SECONDS = 300
 
+# Ограничения каждого блока stateless-промпта: отчёт может содержать полные
+# исходники, а список проверенных не-Python файлов — тысячи путей. Ни один из
+# этих входов не должен бесконтрольно занимать окно той же локальной модели.
+MAX_STEP_GOAL_CHARS = 6000
+MAX_EXECUTOR_REPORT_CHARS = 12000
+MAX_CHECK_REPORT_CHARS = 4000
+
 # Ограничение на длину текста ошибки в отчёте: полный вывод паники компилятора или
 # многотысячный лог не должен съедать контекстное окно модели (см. ШАГ 1).
 MAX_ERROR_CHARS = 4000
@@ -144,16 +151,23 @@ def _as_text(value) -> str:
     return str(value)
 
 
-def _truncate(text: str, limit: int = MAX_ERROR_CHARS) -> str:
-    """Обрезает слишком длинный текст, сохраняя начало и пояснение на русском."""
+def _truncate(text: str, limit: int = MAX_ERROR_CHARS, *, keep_tail: bool = False) -> str:
+    """Оставляет не более limit исходных символов и пояснение об обрезке.
+
+    Для отчёта Исполнителя сохраняем начало и конец: итог и результаты тестов
+    обычно идут после кода. Для ошибок компилятора по-прежнему важнее начало.
+    """
     if len(text) <= limit:
         return text
     hidden = len(text) - limit
-    return (
-        text[:limit]
-        + f"\n... (текст обрезан: скрыто ещё {hidden} символов, "
+    notice = (
+        f"\n... (текст обрезан: скрыто ещё {hidden} символов, "
         "чтобы не переполнять контекст модели)"
     )
+    if keep_tail:
+        tail_chars = limit // 2
+        return text[:limit - tail_chars] + notice + "\n" + text[len(text) - tail_chars:]
+    return text[:limit] + notice
 
 
 def _normalize_file_paths(file_paths) -> list[Path]:
@@ -359,15 +373,16 @@ def _build_review_messages(step_goal: str, executor_report: str, check_report: s
 
     Истории основного чата здесь нет намеренно: изоляция Ревьюера в том, что он не
     видит оправданий и метаний Исполнителя, а получает цель шага, его отчёт и
-    результат машинной проверки файлов.
+    результат машинной проверки файлов. Размер каждого блока ограничен;
+    обрезка отчёта сохраняет также его финал и явно обозначается в промпте.
     """
     user_text = (
         "Цель текущего шага:\n"
-        f"{step_goal or '(цель не передана)'}\n\n"
+        f"{_truncate(step_goal or '(цель не передана)', MAX_STEP_GOAL_CHARS)}\n\n"
         "Отчет/код исполнителя:\n"
-        f"{executor_report or '(отчет не передан)'}\n\n"
+        f"{_truncate(executor_report or '(отчет не передан)', MAX_EXECUTOR_REPORT_CHARS, keep_tail=True)}\n\n"
         "Результат объективной проверки файлов:\n"
-        f"{check_report}"
+        f"{_truncate(check_report, MAX_CHECK_REPORT_CHARS)}"
     )
     return [
         {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
