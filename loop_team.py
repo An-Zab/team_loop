@@ -42,8 +42,8 @@ loop_team.py — ШАГ 5: модернизация главного цикла 
     отклоняется с русским объяснением, а не записывается куда попало;
   * запрос к модели идёт через стандартную библиотеку (urllib) с таймаутом; любая
     сетевая ошибка превращается в понятное русское сообщение, а не в traceback;
-  * если сервер не принимает вызовы инструментов (HTTP 400/404/422), цикл не падает,
-    а переходит в текстовый режим и честно об этом сообщает;
+  * HTTP-ошибка при запросе с инструментами не трактуется как отсутствие поддержки:
+    шаг не принимается без успешного ответа и проверяемых файлов на диске;
   * непредвиденная ошибка внутри цикла сохраняет состояние в handoff.md и завершает
     работу с объяснением на русском;
   * UTF-8 включается в stdout/stderr только в точке входа (if __name__ == "__main__":),
@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -163,16 +164,15 @@ MAX_TOOL_ROUNDS = 8
 # поэтому длинные тексты обрезаются, а не уходят в запрос целиком.
 MAX_TOOL_RESULT_CHARS = 8000
 MAX_FILE_READ_CHARS = 20000
-MAX_FILE_WRITE_CHARS = 200000
+# Ограничиваем один аргумент записи с запасом до Handoff, чтобы содержимое файла
+# вместе с историей не могло в одиночку съесть всё окно модели.
+MAX_FILE_WRITE_CHARS = max(1, min(200000, int(
+    getattr(team_config, "HANDOFF_TOKEN_LIMIT", 24576)
+)))
 MAX_LIST_ENTRIES = 200
 MAX_FEEDBACK_CHARS = 6000
 HANDOFF_SUMMARY_CHARS = 4000
 PRINT_FEEDBACK_CHARS = 700
-
-# Коды HTTP, которые означают «сервер не принял сами вызовы инструментов»
-# (например, llama.cpp-сервер без --jinja). В этом случае цикл повторяет запрос
-# без инструментов и продолжает работу в текстовом режиме.
-TOOLS_REJECTED_CODES = (400, 404, 406, 415, 422)
 
 # Папки, которые инструменты не перечисляют: в них нет содержательных файлов,
 # а перечисление съело бы весь лимит выдачи.
@@ -656,9 +656,9 @@ def _call_local_model(messages: list, tools: list | None = None) -> tuple:
 def _extract_assistant_message(response) -> tuple:
     """Достаёт из ответа пару (текст, список вызовов инструментов).
 
-    Серверы, не поддерживающие function calling, просто не присылают поле
-    tool_calls — тогда возвращается пустой список, и цикл считает шаг выполненным
-    текстовым ответом.
+    Если tool_calls отсутствует, вызывающий цикл всё равно передаёт ответ
+    изолированному Ревьюеру: файловые шаги не могут быть приняты без артефактов
+    на диске, даже если отчёт модели выглядит убедительно.
     """
     if not isinstance(response, dict):
         return "", []
@@ -732,14 +732,13 @@ def _build_step_message(step_text: str, feedback: str) -> str:
 # Исполнитель: агентский цикл с вызовами инструментов
 # ---------------------------------------------------------------------------
 
-def _run_executor(messages: list, step_message: str, state: dict,
+def _run_executor(messages: list, step_message: str,
                   touched_files: list) -> tuple:
     """Один ход Исполнителя: модель вызывает инструменты, затем отчитывается.
 
     Аргументы:
       messages      — история основного чата (изменяется на месте);
       step_message  — сообщение с целью шага и замечаниями ревьюера;
-      state         — словарь с флагом tools_supported на весь запуск;
       touched_files — список записанных файлов (дополняется, Ревьюер его проверяет).
 
     Возвращает пару (отчёт_Исполнителя, последний_ответ_сервера). Отчётом всегда
@@ -749,28 +748,12 @@ def _run_executor(messages: list, step_message: str, state: dict,
     messages.append({"role": "user", "content": step_message})
 
     for _round_index in range(MAX_TOOL_ROUNDS):
-        tools = TOOL_DEFINITIONS if state.get("tools_supported", True) else None
-        response, error, code = _call_local_model(messages, tools)
-
-        if error and tools is not None and code in TOOLS_REJECTED_CODES:
-            # Сервер не умеет function calling. Падаем не в traceback, а в текстовый
-            # режим: модель пишет содержимое файлов прямо в ответ.
-            state["tools_supported"] = False
-            _warn(
-                f"сервер отклонил вызовы инструментов (HTTP {code}) — перехожу на "
-                "текстовый режим без инструментов."
-            )
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Вызовы инструментов недоступны. Опиши результат текстом и "
-                    "приведи полное содержимое каждого создаваемого файла в блоке "
-                    "кода, чтобы его можно было проверить."
-                ),
-            })
-            response, error, code = _call_local_model(messages, None)
+        response, error, _code = _call_local_model(messages, TOOL_DEFINITIONS)
 
         if error:
+            # HTTP-ошибка может означать переполнение контекста или сбой запроса,
+            # а не отсутствие поддержки инструментов. Текстовый fallback запрещён:
+            # его содержимое не будет автоматически записано и проверено на диске.
             return (error, None)
 
         content, tool_calls = _extract_assistant_message(response)
@@ -798,6 +781,12 @@ def _run_executor(messages: list, step_message: str, state: dict,
                 "tool_call_id": call_id,
                 "content": _truncate(result, MAX_TOOL_RESULT_CHARS),
             })
+
+        estimated_tokens = team_config.extract_used_tokens(response, messages)
+        if team_config.is_context_critical(estimated_tokens):
+            # Не начинаем очередной запрос Исполнителя с заполненным окном; вызывающий
+            # цикл сохранит handoff до Ревьюера и следующего шага.
+            return ("Контекст достиг порога Handoff во время вызовов инструментов.", response)
 
     # Раунды кончились, а модель всё ещё вызывает инструменты: просим итог без них.
     _warn(
@@ -918,6 +907,16 @@ def run_team_loop(task: str = "") -> dict:
 
     # СТАРТ: Аналитик (ШАГ 4). handoff_text — содержимое handoff.md, если он был.
     steps, handoff_text, plan_tokens = analyst_planner.build_execution_plan(task_text)
+    if not task_text and handoff_text:
+        # При возобновлении исходные требования берём из сохранённого раздела,
+        # чтобы последующий handoff не заменил их сообщением о пустом аргументе.
+        match = re.search(
+            r"(?ms)^# Исходная задача\s*\n(.*?)(?=^# |\Z)", handoff_text
+        )
+        if match:
+            task_text = match.group(1).strip()
+            if task_text.startswith("Текст исходной задачи не передан"):
+                task_text = ""
     handoff_note = _handoff_summary(handoff_text)
 
     messages: list = [{"role": "system", "content": _build_executor_system(handoff_note)}]
@@ -925,9 +924,8 @@ def run_team_loop(task: str = "") -> dict:
     # в ответе сервера, поэтому считаем её приближённо (ШАГ 1, п.3).
     current_tokens = team_config.extract_used_tokens(None, messages)
 
-    # Флаг живёт на весь запуск: если сервер один раз отверг инструменты,
-    # бессмысленно получать отказ на каждом шаге.
-    state = {"tools_supported": True}
+    # Для каждого запроса инструменты остаются включёнными: единичный HTTP-код
+    # не используется как основание отключать их до конца запуска.
     max_attempts = _max_attempts()
     step_idx = 0
 
@@ -981,11 +979,21 @@ def run_team_loop(task: str = "") -> dict:
                 # 2. Вызов Исполнителя (цель шага и замечания ревьюера).
                 step_message = _build_step_message(step_text, feedback)
                 report, response = _run_executor(
-                    messages, step_message, state, touched_files
+                    messages, step_message, touched_files
                 )
 
                 # 3. Обновление current_tokens по реальному ответу сервера.
                 current_tokens = team_config.extract_used_tokens(response, messages)
+                if team_config.is_context_critical(current_tokens):
+                    return _stop_for_handoff(
+                        task_text, steps, step_idx, messages,
+                        (
+                            f"Контекст достиг порога Handoff внутри попытки: "
+                            f"{current_tokens} токенов; остановка перед следующим "
+                            "вызовом модели."
+                        ),
+                        "context_handoff", current_tokens,
+                    )
                 print(
                     f"Ответ Исполнителя получен "
                     f"[Used: {current_tokens} / Limit: "
@@ -999,9 +1007,19 @@ def run_team_loop(task: str = "") -> dict:
 
                 # 4. Вызов Изолированного Ревьюера (ШАГ 2) — отдельным stateless
                 #    запросом, без истории основного чата.
-                review = isolated_reviewer.review_step(
-                    step_text, report, list(touched_files)
-                )
+                if response is None:
+                    review = {
+                        "accepted": False,
+                        "feedback": (
+                            "Запрос Исполнителя завершился ошибкой; шаг не может быть "
+                            "принят без успешного ответа сервера. " + _truncate(report, 1000)
+                        ),
+                        "review_tokens": 0,
+                    }
+                else:
+                    review = isolated_reviewer.review_step(
+                        step_text, report, list(touched_files)
+                    )
                 if not isinstance(review, dict):
                     review = {
                         "accepted": False,
@@ -1247,14 +1265,14 @@ def main() -> int:
     print("=" * 62)
     print("Исполнитель СОЗДАЁТ И МЕНЯЕТ файлы в папке проекта — это его работа.")
     print("Нужен запущенный локальный сервер модели (см. .env и .env.example).")
-    print("Остановка: Ctrl+C (состояние в handoff.md при этом НЕ сохраняется).")
+    print("Остановка: Ctrl+C (загруженный handoff остаётся доступен в handoff.bak).")
     print(f"Задача: {_truncate(task, 300)}")
 
     try:
         result = run_team_loop(task)
     except KeyboardInterrupt:
         print("\n[ПРЕРВАНО] работа остановлена клавишей Ctrl+C.")
-        print("handoff.md не создан: перезапусти цикл, и он начнёт с начала задачи.")
+        print("Новый handoff не создан. Если был загружен handoff, исходная точка остаётся в handoff.bak.")
         return 130
     except Exception as exc:  # последняя страховка: без голого traceback
         print(f"\n[ОШИБКА] цикл завершился непредвиденной ошибкой: "
@@ -1276,7 +1294,8 @@ def main() -> int:
         print(f"\nРЕЗУЛЬТАТ: контекст модели заполнен, {state_note}.")
         if saved:
             print("Это штатная остановка: продолжай работу новым запуском цикла.")
-        return 0
+            return 0
+        return 1
     if status == "attempts_exhausted":
         print(f"\nРЕЗУЛЬТАТ: шаг не принят ревьюером, {state_note}.")
         print("Что делать: открой handoff.md, прочитай замечания ревьюера и уточни")

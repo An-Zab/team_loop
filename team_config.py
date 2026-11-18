@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import codecs
 import io
+import json
 import math
 import os
 import re
@@ -706,6 +707,25 @@ def extract_used_tokens(api_response, messages_fallback: list) -> int:
     total_chars = 0
     for message in messages_fallback or []:
         total_chars += len(_message_content_text(message))
+        if isinstance(message, dict):
+            # Аргументы вызовов инструментов часто содержат целые файлы; без них
+            # запасная оценка резко занижает размер истории при отсутствии usage.
+            calls = message.get("tool_calls", [])
+            if isinstance(calls, list):
+                for call in calls:
+                    if isinstance(call, dict):
+                        function = call.get("function")
+                        if isinstance(function, dict):
+                            arguments = function.get("arguments")
+                            if isinstance(arguments, str):
+                                total_chars += len(arguments)
+                            elif arguments is not None:
+                                try:
+                                    total_chars += len(json.dumps(
+                                        arguments, ensure_ascii=False, sort_keys=True
+                                    ))
+                                except (TypeError, ValueError):
+                                    total_chars += len(str(arguments))
     return total_chars // _estimate_divisor()
 
 

@@ -1152,11 +1152,8 @@ def _archive_handoff(path: Path) -> bool:
 def load_handoff_if_exists() -> "str | None":
     """Читает handoff.md и убирает его с дороги (ШАГ 3, п.2).
 
-    Если файла нет — возвращает None. Если есть — читает содержимое, переименовывает
-    handoff.md в handoff.bak (старый .bak перезаписывается) и возвращает текст.
-
-    Файл переименовывается, а не удаляется: это страховка на случай, если новый чат
-    продолжит работу неудачно, — состояние работы останется в handoff.bak.
+    Если handoff.md есть — читает и переносит его в handoff.bak. Если его нет,
+    резервный handoff.bak читается как точка восстановления после прерывания.
     """
     path = _handoff_file_path()
     try:
@@ -1167,6 +1164,14 @@ def load_handoff_if_exists() -> "str | None":
         return None
 
     if not exists:
+        # После успешного планирования исходный файл хранится в .bak как точка
+        # восстановления; прерывание выполнения не должно делать её невидимой.
+        backup = _backup_file_path()
+        try:
+            if backup.is_file():
+                return _read_handoff_text(backup)
+        except OSError:
+            _warn(f"Не удалось проверить резервный файл {backup}.")
         return None
 
     text = _read_handoff_text(path)
@@ -1376,10 +1381,11 @@ def _self_check() -> bool:
         print(f"  handoff.bak создан        : [{'OK' if backup_path.is_file() else 'ОШИБКА'}]")
         ok = ok and (not still_there) and backup_path.is_file()
 
-        print("\nШАГ ДЕМОНСТРАЦИИ 3. Повторная загрузка без файла:")
+        print("\nШАГ ДЕМОНСТРАЦИИ 3. Повторная загрузка из резервного файла:")
         again = load_handoff_if_exists()
-        print(f"  вернул None               : [{'OK' if again is None else 'ОШИБКА'}]")
-        ok = ok and again is None
+        resumed = again is not None and again.strip() == document.strip()
+        print(f"  handoff.bak доступен для продолжения: [{'OK' if resumed else 'ОШИБКА'}]")
+        ok = ok and resumed
 
         print("\nШАГ ДЕМОНСТРАЦИИ 4. Второй handoff перезаписывает старый .bak:")
         second = generate_handoff(task, plan, 1, messages, "Проверка перезаписи .bak.")
