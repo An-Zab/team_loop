@@ -32,8 +32,10 @@ analyst_planner.py — ШАГ 4: Аналитик и декомпозиция п
 Второй принцип: handoff — это точка продолжения работы, и Аналитик не имеет права
 её потерять. load_handoff_if_exists() забирает handoff.md и убирает его в
 handoff.bak, поэтому если план построить не удалось (модель молчит), прочитанный
-текст возвращается обратно в handoff.md: следующий запуск снова продолжит работу
-с того же места, а не начнёт её заново с пустого листа.
+текст возвращается обратно в handoff.md через finally при любом неуспешном выходе,
+включая исключение парсера и прерывание пользователем. KeyboardInterrupt и SystemExit
+не подавляются: файл восстанавливается до передачи прерывания вызывающему коду.
+Следующий запуск снова продолжит работу с того же места, а не начнёт её заново.
 
 Совместимость с Windows и защита от падения (правило 2 PLAN.md):
   * pathlib.Path для путей, явный encoding="utf-8" при восстановлении handoff.md;
@@ -529,7 +531,13 @@ def _parse_plan_answer(answer: str) -> tuple[list[str], bool]:
         return ([], False)
 
     text = _strip_fence_lines(text)
-    steps, recognized = _parse_json_steps(text)
+    try:
+        steps, recognized = _parse_json_steps(text)
+    except RecursionError:
+        # Слишком глубокий JSON может сломать и raw_decode (массив/объект), и
+        # извлечение вложенных шагов. Это повреждённый ответ, НЕ пустой план []:
+        # иначе handoff был бы ошибочно принят за уже завершённый проект.
+        return ([], False)
     if recognized:
         return (_finalize_steps(steps), True)
 
@@ -876,72 +884,82 @@ def build_execution_plan(user_task: str = "") -> tuple[list[str], "str | None", 
     без точки продолжения.
     """
     task = _as_text(user_task).strip()
-    handoff_text = _load_handoff()
+    handoff_text = None
+    tokens = 0
+    plan_built = False
 
-    if not task and handoff_text is None:
-        # Запрашивать у модели план для пустоты бессмысленно: получили бы
-        # пять минут ожидания и мусор вместо плана.
-        _warn(
-            "текст задачи не передан и handoff.md не найден — "
-            f"{DEGRADED_NOTICE}."
-        )
-        return (_degraded_plan(task, handoff_text), None, 0)
+    # С момента загрузки handoff любой неуспешный выход обязан вернуть файл.
+    # finally покрывает и незапланированные исключения, и KeyboardInterrupt /
+    # SystemExit; последние намеренно не поглощаем обработчиком Exception.
+    try:
+        handoff_text = _load_handoff()
+        if not task and handoff_text is None:
+            # Запрашивать у модели план для пустоты бессмысленно: получили бы
+            # пять минут ожидания и мусор вместо плана.
+            _warn(
+                "текст задачи не передан и handoff.md не найден — "
+                f"{DEGRADED_NOTICE}."
+            )
+            return (_degraded_plan(task, handoff_text), None, 0)
 
-    messages = _build_plan_messages(task, handoff_text)
-    response, error = _call_local_model(messages)
+        messages = _build_plan_messages(task, handoff_text)
+        response, error = _call_local_model(messages)
 
-    if error is not None:
-        _warn(f"{error} {DEGRADED_NOTICE_SENTENCE}.")
-        _restore_handoff_after_failure(handoff_text)
-        return (_degraded_plan(task, handoff_text), handoff_text, 0)
+        if error is not None:
+            _warn(f"{error} {DEGRADED_NOTICE_SENTENCE}.")
+            return (_degraded_plan(task, handoff_text), handoff_text, 0)
 
-    answer = _extract_answer_text(response)
-    tokens = team_config.extract_used_tokens(response, messages)
+        answer = _extract_answer_text(response)
+        tokens = team_config.extract_used_tokens(response, messages)
 
-    if not answer:
-        _warn(
-            f"{MODEL_ERROR_PREFIX}модель вернула пустой ответ без текста. Обычно "
-            "так бывает, если модель ещё не загрузила weights или генерация "
-            f"обрезалась нулевой длиной. {DEGRADED_NOTICE_SENTENCE}."
-        )
-        _restore_handoff_after_failure(handoff_text)
-        return (_degraded_plan(task, handoff_text), handoff_text, tokens)
+        if not answer:
+            _warn(
+                f"{MODEL_ERROR_PREFIX}модель вернула пустой ответ без текста. Обычно "
+                "так бывает, если модель ещё не загрузила weights или генерация "
+                f"обрезалась нулевой длиной. {DEGRADED_NOTICE_SENTENCE}."
+            )
+            return (_degraded_plan(task, handoff_text), handoff_text, tokens)
 
-    steps, recognized = _parse_plan_answer(answer)
+        steps, recognized = _parse_plan_answer(answer)
 
-    if recognized and not steps:
-        if handoff_text is not None:
+        if not recognized:
+            _warn(
+                f"{MODEL_ERROR_PREFIX}ответ модели не похож ни на JSON-массив, ни на "
+                f"нумерованный список. Ответ модели: {_truncate(answer, 800)} "
+                f"{DEGRADED_NOTICE_SENTENCE}."
+            )
+            return (_degraded_plan(task, handoff_text), handoff_text, tokens)
+
+        if not steps:
+            if handoff_text is None:
+                _warn(
+                    f"{MODEL_ERROR_PREFIX}модель вернула пустой список шагов. "
+                    f"{DEGRADED_NOTICE_SENTENCE}."
+                )
+                return (_degraded_plan(task, handoff_text), handoff_text, tokens)
             # Модель посмотрела на handoff и не нашла невыполненных шагов.
             # Придумывать работу за неё не будем: отдаём один контрольный шаг.
             _warn(
                 "модель не нашла в handoff невыполненных шагов — план состоит из "
                 "одного контрольного шага."
             )
-            return (
-                [
-                    "Сверь результат с исходной задачей из handoff и заверши "
-                    "проект: невыполненных шагов в плане не осталось"
-                ],
-                handoff_text,
-                tokens,
-            )
+            steps = [
+                "Сверь результат с исходной задачей из handoff и заверши "
+                "проект: невыполненных шагов в плане не осталось"
+            ]
+
+        plan_built = True
+        return (steps, handoff_text, tokens)
+    except Exception as exc:
         _warn(
-            f"{MODEL_ERROR_PREFIX}модель вернула пустой список шагов. "
+            f"{MODEL_ERROR_PREFIX}непредвиденная ошибка планирования: "
+            f"{type(exc).__name__}: {_truncate(_as_text(exc), 800)}. "
             f"{DEGRADED_NOTICE_SENTENCE}."
         )
-        _restore_handoff_after_failure(handoff_text)
         return (_degraded_plan(task, handoff_text), handoff_text, tokens)
-
-    if not recognized:
-        _warn(
-            f"{MODEL_ERROR_PREFIX}ответ модели не похож ни на JSON-массив, ни на "
-            f"нумерованный список. Ответ модели: {_truncate(answer, 800)} "
-            f"{DEGRADED_NOTICE_SENTENCE}."
-        )
-        _restore_handoff_after_failure(handoff_text)
-        return (_degraded_plan(task, handoff_text), handoff_text, tokens)
-
-    return (steps, handoff_text, tokens)
+    finally:
+        if not plan_built:
+            _restore_handoff_after_failure(handoff_text)
 
 
 # ---------------------------------------------------------------------------
