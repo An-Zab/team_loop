@@ -2,3 +2,7 @@
 .env
 __pycache__/
 *.pyc
+
+# Файлы состояния механизма Handoff
+handoff.md
+handoff.bak

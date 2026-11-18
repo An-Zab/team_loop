@@ -14,7 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-SRC = Path(sys.argv[1] if len(sys.argv) > 1 else r"F:\Projects\team_loop\team_config.py").resolve()
+SRC = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "team_config.py").resolve()
 LABEL = sys.argv[2] if len(sys.argv) > 2 else "HEAD"
 
 CONFIG_VARS = (
