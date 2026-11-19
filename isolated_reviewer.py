@@ -588,22 +588,8 @@ def review_step(step_goal: str, executor_report: str, modified_files: list[str] 
             "review_tokens": 0,
         }
 
-    # Только если Исполнитель вообще не передал путей: результаты компиляции и
-    # точные ошибки выше должны сохранять приоритет и диагностическую точность.
-    file_required = bool(re.search(
-        r"(?:созда|записа|сохрани|измени|обнови|добави|реализу|напиши|файл|модул|скрипт|код)",
-        goal.lower(),
-    ))
-    if file_required and not _normalize_file_paths(modified_files):
-        return {
-            "accepted": False,
-            "feedback": (
-                "Шаг требует файлового результата, но Исполнитель не передал ни одного "
-                "пути к файлу. Используй write_file и передай путь для проверки."
-            ),
-            "review_tokens": 0,
-        }
-
+    # При чистых объективных проверках окончательную оценку оставляем модели:
+    # формулировка шага может описывать запуск тестов, импорт или проверку без записи.
     messages = _build_review_messages(goal, report, checks["report"])
     response, error = _call_local_model(messages)
     if error is not None:

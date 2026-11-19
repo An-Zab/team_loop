@@ -1,8 +1,8 @@
 # Путь: F:\Projects\team_loop\run_strata_team.py
 # Назначение: ШАГ 6 — точка входа в автономный цикл команды для консоли Windows:
 #             обычный запуск с текстом задачи, продолжение работы из handoff.md
-#             (--resume) и стресс-тест механизма Handoff (--test-handoff) с
-#             намеренно заниженным порогом в 800 токенов.
+#             (--resume) и стресс-тест механизма Handoff (--test-handoff):
+#             обычный бюджет первого шага, сохранение Handoff сразу после него.
 # Кодировка исходника: UTF-8 (в Python 3 она включена по умолчанию).
 """
 run_strata_team.py — ШАГ 6: точка входа и режим стресс-теста.
@@ -15,9 +15,9 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
   * `python run_strata_team.py --resume` — продолжение работы напрямую из
     `handoff.md` (или резервного `handoff.bak`), текст задачи вводить не нужно;
   * `python run_strata_team.py "Текст задачи" --test-handoff` — стресс-тест:
-    порог `HANDOFF_TOKEN_LIMIT` занижается до 800 токенов; успех засчитывается
-    только если ровно первый шаг принят, цикл остановился на следующем и handoff
-    сохранён, иначе команда возвращает ошибку вместо ложного успеха.
+    первый шаг выполняется с обычным бюджетом записи; только после его принятия
+    тестовый порог снижается (не выше 800), и перед вторым шагом вызывается штатный
+    Handoff. Успех требует одного принятого шага и сохранённого файла состояния.
 
 Сам цикл живёт в `loop_team.py` (ШАГ 5): он печатает номер шага, номер попытки,
 строки `[Used: X / Limit: Y]` и вердикт Ревьюера. Эта точка входа добавляет то,
@@ -25,11 +25,12 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
 работы (из чего продолжать, что будет перезаписано), печать действующих лимитов
 и человеческое резюме итога с кодом возврата.
 
-Почему понижение порога сделано присваиванием переменной. Шаг 1 (`team_config.py`)
-читает `HANDOFF_TOKEN_LIMIT` как глобальную переменную модуля в момент вызова
-`is_context_critical()`, поэтому `team_config.HANDOFF_TOKEN_LIMIT = 800` действует
-сразу для всего цикла и отменяется самим завершением процесса: файл `.env` не
-меняется, руками ничего возвращать не нужно.
+Стресс-тест не понижает порог до начала работы: иначе оценка уже заполненного
+системного промпта и небольшая write-бюджетная квота могли бы остановить его до
+первого шага. После принятия первого шага цикл временно снижает порог до текущего
+заполнения окна (не выше 800), затем на следующем шаге проходит ту же ветку
+`is_context_critical()` и сохранения, что и штатный Handoff. Исходный лимит
+восстанавливается после вызова; файл `.env` не меняется.
 
 Совместимость с Windows и защита от падения (правило 2 PLAN.md):
   * pathlib.Path для путей; перед `--resume` точка входа проверяет, что handoff
@@ -101,10 +102,9 @@ __all__ = ["main"]
 # Константы точки входа
 # ---------------------------------------------------------------------------
 
-# Порог Handoff для режима стресс-теста (--test-handoff) — ровно 800 токенов,
-# как требует ТЗ (PLAN.md, ШАГ 6, п.1). Само понижение порога не гарантирует
-# Handoff после шага: ниже отдельно проверяется фактический статус, сохранение
-# файла и число принятых шагов.
+# Верхняя граница порога Handoff для стресс-теста (--test-handoff). После
+# принятия первого шага порог динамически понижается до текущего заполнения окна,
+# поэтому Handoff запрашивается до того, как цикл начнёт второй шаг.
 TEST_HANDOFF_TOKEN_LIMIT = 800
 
 # Коды возврата процесса: 0 — успех, 1 — работа не завершена,
@@ -294,29 +294,23 @@ def _build_parser() -> argparse.ArgumentParser:
 # Проверки ДО запуска и стресс-режим
 # ---------------------------------------------------------------------------
 
-def _apply_test_handoff_limit() -> None:
-    """Занижает `HANDOFF_TOKEN_LIMIT` до 800 токенов на время этого запуска.
-
-    Работает потому, что Шаг 1 читает `HANDOFF_TOKEN_LIMIT` как глобальную
-    переменную модуля в момент вызова `is_context_critical()`. После завершения
-    процесса значение исчезает само: `.env` и обычные запуски не меняются.
-    """
+def _announce_test_handoff_mode() -> None:
+    """Объясняет стресс-режим: сначала выполняется шаг, затем снижается порог."""
     previous = _current_handoff_limit()
-    team_config.HANDOFF_TOKEN_LIMIT = TEST_HANDOFF_TOKEN_LIMIT
-    effective = _current_handoff_limit()
+    max_context = _config_int("MAX_CONTEXT_TOKENS", 0)
+    target = (
+        min(TEST_HANDOFF_TOKEN_LIMIT, max_context)
+        if max_context >= 1 else TEST_HANDOFF_TOKEN_LIMIT
+    )
     print("\n" + "=" * 62)
     print("РЕЖИМ СТРЕСС-ТЕСТА HANDOFF (--test-handoff)")
     print("=" * 62)
-    print(f"Порог Handoff          : {previous} -> {TEST_HANDOFF_TOKEN_LIMIT} токенов")
-    print(f"Действующий порог      : {effective} "
-          f"(MAX_CONTEXT_TOKENS = {_config_int('MAX_CONTEXT_TOKENS', 0)})")
-    print("Это только текущий запуск: файл .env не изменён, после выхода всё вернётся.")
-    print("Успех: ровно первый шаг принят, затем цикл штатно остановился и сохранил handoff.")
-    print("Если порог достигнут до принятия шага, после нескольких шагов или задача")
-    print("завершилась без Handoff, тест вернёт код 1; проверь размер шага и настройки модели.")
-    if effective < TEST_HANDOFF_TOKEN_LIMIT:
-        print("[ВНИМАНИЕ] MAX_CONTEXT_TOKENS меньше 800, поэтому порог зажат до")
-        print(f"{effective} — Handoff сработает ещё раньше.")
+    print(f"Порог во время первого шага : {previous} токенов")
+    print(f"Предельный тестовый порог   : {target} токенов")
+    print("Сначала цикл даст Исполнителю завершить и проверить ровно один шаг.")
+    print("После его принятия порог временно снижается до текущего заполнения окна")
+    print("(не выше 800), чтобы штатный Handoff сработал перед следующим шагом.")
+    print("Это действует только в текущем процессе; файл .env не меняется.")
 
 
 def _check_arguments(task: str, resume: bool) -> str:
@@ -421,13 +415,14 @@ def _print_startup_info(task: str, resume: bool, test_handoff: bool,
     print(f"OPENAI_BASE_URL       : {getattr(team_config, 'OPENAI_BASE_URL', '')}")
     max_context = _config_int("MAX_CONTEXT_TOKENS", 0)
     active_limit = _current_handoff_limit()
+    print(f"MAX_CONTEXT_TOKENS    : {max_context}")
+    print(f"HANDOFF_TOKEN_LIMIT   : {active_limit}")
     if test_handoff:
-        active_limit = (
+        test_limit = (
             min(TEST_HANDOFF_TOKEN_LIMIT, max_context)
             if max_context >= 1 else TEST_HANDOFF_TOKEN_LIMIT
         )
-    print(f"MAX_CONTEXT_TOKENS    : {max_context}")
-    print(f"HANDOFF_TOKEN_LIMIT   : {active_limit}")
+        print(f"Тестовый порог после шага 1: не выше {test_limit}")
     print(f"MAX_STEP_ATTEMPTS     : {_config_int('MAX_STEP_ATTEMPTS', 3)}")
     print(f"handoff.md            : {handoff_path} "
           f"[{'есть, ' + _read_size(handoff_path) if _is_file(handoff_path) else 'нет'}]")
@@ -485,6 +480,15 @@ def _print_summary(result: dict) -> int:
         print("handoff.md НЕ сохранён: причина напечатана выше строками [loop_team].")
         print("Частые причины: файл открыт в Блокноте или неверный HANDOFF_FILE в .env.")
         return EXIT_FAILED
+
+    if status == "interrupted":
+        print("\nРезультат             : работа прервана клавишей Ctrl+C")
+        if saved:
+            print("Точка продолжения сохранена. Возобнови работу командой:")
+            print("  python run_strata_team.py --resume")
+        else:
+            print("Не удалось сохранить новую точку продолжения; проверь сообщение выше.")
+        return EXIT_INTERRUPTED
 
     if status == "attempts_exhausted":
         print("\nРезультат             : шаг не принят ревьюером, попытки исчерпаны")
@@ -599,14 +603,18 @@ def main() -> int:
     _print_startup_info(task, resume, test_handoff, handoff_path, backup_path)
 
     if test_handoff:
-        _apply_test_handoff_limit()
+        _announce_test_handoff_mode()
 
     try:
-        result = loop_team.run_team_loop(task, resume_backup=resume)
+        result = loop_team.run_team_loop(
+            task,
+            resume_backup=resume,
+            test_handoff_limit=(TEST_HANDOFF_TOKEN_LIMIT if test_handoff else None),
+        )
     except KeyboardInterrupt:
         print("\n[ПРЕРВАНО] работа остановлена клавишей Ctrl+C.")
-        print("Новый handoff.md не создан. Ранее сохранённый handoff.md (или")
-        print("handoff.bak) остался на диске — его подхватит запуск с --resume.")
+        print("Если цикл уже выполнял шаг, он должен был сохранить handoff.md.")
+        print("Проверь handoff.md и handoff.bak; продолжить можно командой --resume.")
         return EXIT_INTERRUPTED
     except Exception as exc:  # последняя страховка: без голого traceback
         print("\n[ОШИБКА] запуск завершился непредвиденной ошибкой: "
@@ -615,6 +623,14 @@ def main() -> int:
         return EXIT_FAILED
 
     code = _print_summary(result)
+
+    if (test_handoff and isinstance(result, dict)
+            and _as_text(result.get("status")) == "interrupted"):
+        print(
+            "\nСТРЕСС-ТЕСТ ПРЕРВАН: результат не оценивается, "
+            "состояние сохранено по возможности."
+        )
+        return EXIT_INTERRUPTED
 
     if test_handoff:
         passed, reason = _validate_test_handoff_result(result, handoff_path)

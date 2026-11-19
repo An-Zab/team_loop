@@ -43,9 +43,10 @@ loop_team.py — ШАГ 5: модернизация главного цикла 
   * запрос к модели идёт через стандартную библиотеку (urllib) с таймаутом; любая
     сетевая ошибка превращается в понятное русское сообщение, а не в traceback;
   * HTTP-ошибка при запросе с инструментами не трактуется как отсутствие поддержки:
-    шаг не принимается без успешного ответа и проверяемых файлов на диске;
-  * непредвиденная ошибка внутри цикла сохраняет состояние в handoff.md и завершает
-    работу с объяснением на русском;
+    текстовый fallback не используется как доказательство записи, а переданные пути
+    и синтаксис Python проверяются объективно;
+  * непредвиденная ошибка и Ctrl+C после начала выполнения сохраняют состояние в
+    handoff.md и завершают работу с объяснением на русском;
   * UTF-8 включается в stdout/stderr только в точке входа (if __name__ == "__main__":),
     при импорте модуля потоки процесса хоста не меняются.
 """
@@ -125,7 +126,9 @@ EXECUTOR_SYSTEM_PROMPT = (
     "Правила работы: "
     "1) Файлы создавай и меняй только инструментом write_file, читай их инструментом "
     "read_file, содержимое папок смотри через list_files. Слова «я создал файл» без "
-    "вызова инструмента считаются невыполненной работой. "
+    "вызова инструмента считаются невыполненной работой. Для существующего файла "
+    "write_file разрешён только после полного чтения содержимого. Если read_file "
+    "сообщил об обрезке или неверной кодировке, не пытайся перезаписать файл. "
     "2) Пиши файл целиком: без заглушек вида «... остальной код здесь ...», без "
     "многоточий вместо кода и без комментариев TODO. "
     "3) Пути указывай относительно папки проекта, например helper.py или "
@@ -188,7 +191,10 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Читает текстовый файл проекта и возвращает его содержимое.",
+            "description": (
+                "Читает файл проекта в UTF-8. Длинное содержимое обрезается; такой "
+                "файл нельзя перезаписывать инструментом write_file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -206,8 +212,9 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "write_file",
             "description": (
-                "Записывает файл целиком (перекодирует в UTF-8, создаёт нужные "
-                "папки). Содержимое нужно передавать полностью, без заглушек."
+                "Записывает файл целиком (создаёт нужные папки). Существующий файл "
+                "можно перезаписать только после полного чтения его содержимого в этом "
+                "шаге. Содержимое передавай полностью, без заглушек."
             ),
             "parameters": {
                 "type": "object",
@@ -418,32 +425,59 @@ def _relative_display(path: Path) -> str:
         return str(path)
 
 
-def _tool_read_file(arguments: dict) -> str:
-    """Инструмент read_file: содержимое файла проекта или русское объяснение неудачи."""
+def _record_file_read(path: Path, complete: bool,
+                      file_read_state: dict[Path, bool] | None) -> None:
+    """Запоминает, был ли файл целиком доступен Исполнителю в текущем шаге."""
+    if file_read_state is not None:
+        file_read_state[path] = complete
+
+
+def _tool_read_file(arguments: dict,
+                    file_read_state: dict[Path, bool] | None = None) -> str:
+    """Читает файл строго в UTF-8; отмечает усечённое чтение для защиты записи."""
     path, error = _safe_project_path(arguments.get("path"))
     if path is None:
         return error
 
     try:
         if not path.is_file():
+            if file_read_state is not None:
+                file_read_state.pop(path, None)
             return f"Файл не найден: {_relative_display(path)}. Проверь путь через list_files."
     except OSError as exc:
+        _record_file_read(path, False, file_read_state)
         return f"Не удалось проверить файл {_relative_display(path)}: {exc}"
 
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        _record_file_read(path, False, file_read_state)
+        return (
+            f"Не удалось прочитать {_relative_display(path)} как UTF-8. "
+            "Перекодируй файл явно перед изменением; его перезапись запрещена, "
+            "чтобы не потерять содержимое."
+        )
     except (OSError, UnicodeError, ValueError) as exc:
+        _record_file_read(path, False, file_read_state)
         reason = _as_text(exc.strerror) or _as_text(exc)
         return f"Не удалось прочитать {_relative_display(path)}: {reason}"
 
-    if not text.strip():
+    if not text:
+        _record_file_read(path, True, file_read_state)
         return f"Файл {_relative_display(path)} пустой."
-    return _truncate(text, MAX_FILE_READ_CHARS)
+
+    output_limit = min(MAX_FILE_READ_CHARS, MAX_TOOL_RESULT_CHARS)
+    complete = len(text) <= output_limit
+    _record_file_read(path, complete, file_read_state)
+    if not complete:
+        return _truncate(text, output_limit)
+    return text
 
 
 def _tool_write_file(arguments: dict, touched_files: list,
-                     max_chars: int = MAX_FILE_WRITE_CHARS) -> str:
-    """Инструмент write_file: запись файла целиком в UTF-8 внутри папки проекта."""
+                     max_chars: int = MAX_FILE_WRITE_CHARS,
+                     file_read_state: dict[Path, bool] | None = None) -> str:
+    """Записывает файл целиком, только если существующее содержимое было прочитано."""
     path, error = _safe_project_path(arguments.get("path"))
     if path is None:
         return error
@@ -464,6 +498,22 @@ def _tool_write_file(arguments: dict, touched_files: list,
         )
 
     try:
+        existing = path.exists()
+    except OSError as exc:
+        return f"Не удалось проверить файл {_relative_display(path)} перед записью: {exc}"
+    if existing and (file_read_state is None or file_read_state.get(path) is not True):
+        if file_read_state is not None and path in file_read_state:
+            reason = "его чтение было усечено или не удалось декодировать как UTF-8"
+        else:
+            reason = "его содержимое не было полностью прочитано в текущем шаге"
+        return (
+            f"Перезапись {_relative_display(path)} запрещена: {reason}. "
+            "write_file заменяет файл целиком и может удалить невидимую часть. "
+            f"Полный вывод read_file ограничен {min(MAX_FILE_READ_CHARS, MAX_TOOL_RESULT_CHARS)} "
+            "символами; не перезаписывай этот файл целиком."
+        )
+
+    try:
         if path.parent and not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -479,6 +529,10 @@ def _tool_write_file(arguments: dict, touched_files: list,
             "открыт в Блокноте или его держит антивирус — закрой файл."
         )
 
+    if file_read_state is not None:
+        # Исполнитель сам передал полное новое содержимое; повторные изменения этой
+        # версии в том же шаге не требуют повторного чтения.
+        file_read_state[path] = True
     display = _relative_display(path)
     if path not in touched_files:
         touched_files.append(path)
@@ -536,7 +590,8 @@ def _parse_arguments(raw) -> dict:
 
 
 def _execute_tool_call(name: str, raw_arguments, touched_files: list,
-                       max_file_write_chars: int = MAX_FILE_WRITE_CHARS) -> str:
+                       max_file_write_chars: int = MAX_FILE_WRITE_CHARS,
+                       file_read_state: dict[Path, bool] | None = None) -> str:
     """Выполняет один вызов инструмента и всегда возвращает текст для модели.
 
     Любая ошибка превращается в русское сообщение: исключение разорвало бы
@@ -545,9 +600,11 @@ def _execute_tool_call(name: str, raw_arguments, touched_files: list,
     try:
         arguments = _parse_arguments(raw_arguments)
         if name == "read_file":
-            return _tool_read_file(arguments)
+            return _tool_read_file(arguments, file_read_state)
         if name == "write_file":
-            return _tool_write_file(arguments, touched_files, max_file_write_chars)
+            return _tool_write_file(
+                arguments, touched_files, max_file_write_chars, file_read_state
+            )
         if name == "list_files":
             return _tool_list_files(arguments)
         return (
@@ -673,8 +730,8 @@ def _extract_assistant_message(response) -> tuple:
     """Достаёт из ответа пару (текст, список вызовов инструментов).
 
     Если tool_calls отсутствует, вызывающий цикл всё равно передаёт ответ
-    изолированному Ревьюеру: файловые шаги не могут быть приняты без артефактов
-    на диске, даже если отчёт модели выглядит убедительно.
+    изолированному Ревьюеру: проверка файлов не подменяет оценку цели шага, а
+    отсутствие изменённых файлов само по себе не является ни принятием, ни отказом.
     """
     if not isinstance(response, dict):
         return "", []
@@ -744,6 +801,26 @@ def _build_step_message(step_text: str, feedback: str) -> str:
     return "\n".join(lines)
 
 
+def _normalize_tool_call_ids(tool_calls: list, round_index: int,
+                             used_ids: set[str]) -> list[dict]:
+    """Гарантирует, что каждый ответ tool ссылается на ID из assistant tool_calls."""
+    normalized = []
+    for call_index, source in enumerate(tool_calls):
+        call = dict(source)
+        call_id = _as_text(call.get("id")).strip()
+        if not call_id or call_id in used_ids:
+            base = f"call_{round_index}_{call_index}"
+            call_id = base
+            suffix = 1
+            while call_id in used_ids:
+                call_id = f"{base}_{suffix}"
+                suffix += 1
+        call["id"] = call_id
+        used_ids.add(call_id)
+        normalized.append(call)
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Исполнитель: агентский цикл с вызовами инструментов
 # ---------------------------------------------------------------------------
@@ -762,6 +839,8 @@ def _run_executor(messages: list, step_message: str,
     вернёт ДОРАБОТАТЬ с понятной человеку причиной, а цикл продолжит попытки.
     """
     messages.append({"role": "user", "content": step_message})
+    file_read_state: dict[Path, bool] = {}
+    used_tool_call_ids: set[str] = set()
 
     for _round_index in range(MAX_TOOL_ROUNDS):
         response, error, _code = _call_local_model(messages, TOOL_DEFINITIONS)
@@ -786,6 +865,9 @@ def _run_executor(messages: list, step_message: str,
             messages.append({"role": "assistant", "content": content})
             return (content or "(модель вернула пустой ответ без текста)", response)
 
+        tool_calls = _normalize_tool_call_ids(
+            tool_calls, _round_index, used_tool_call_ids
+        )
         # История OpenAI требует assistant-сообщение с tool_calls и ответ по каждому
         # вызову: без них следующий запрос сервер отвергнет ошибкой.
         messages.append({
@@ -797,10 +879,11 @@ def _run_executor(messages: list, step_message: str,
             function = call.get("function")
             if not isinstance(function, dict):
                 function = {}
-            call_id = _as_text(call.get("id")).strip() or f"call_{call_index}"
+            call_id = _as_text(call.get("id")).strip()
             name = _as_text(function.get("name")).strip()
             result = _execute_tool_call(
-                name, function.get("arguments"), touched_files, write_budget
+                name, function.get("arguments"), touched_files, write_budget,
+                file_read_state,
             )
             if name == "write_file" and result.startswith("Файл записан:"):
                 arguments = _parse_arguments(function.get("arguments"))
@@ -867,7 +950,8 @@ def _prune_step_history(messages: list, checkpoint: int, final_report: str) -> i
 # ---------------------------------------------------------------------------
 
 def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list,
-                      blocker: str, status: str, current_tokens: int) -> dict:
+                      blocker: str, status: str, current_tokens: int, *,
+                      use_model: bool = True) -> dict:
     """Сохраняет handoff.md, уведомляет консоль и формирует итог остановки.
 
     Используется в трёх случаях из ТЗ: контекст критичен, попытки исчерпаны,
@@ -882,7 +966,7 @@ def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list
     document = None
     try:
         document = handoff_manager.generate_handoff(
-            task_text, steps, step_idx, messages, blocker
+            task_text, steps, step_idx, messages, blocker, use_model=use_model
         )
     except Exception as exc:  # сохранение не должно ронять цикл
         _warn(
@@ -917,27 +1001,67 @@ def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list
 # Публичная функция Шага 5: главный цикл
 # ---------------------------------------------------------------------------
 
-def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
+def run_team_loop(task: str = "", *, resume_backup: bool = False,
+                  test_handoff_limit: int | None = None) -> dict:
     """Запускает полный цикл: план -> (Исполнитель <-> Ревьюер) по каждому шагу.
 
-    Аргумент: task — текст задачи пользователя. При продолжении работы из
-    handoff.md его можно оставить пустым (ШАГ 4 сам достанет задачу из файла).
+    Аргументы: task — текст задачи пользователя; resume_backup разрешает явное
+    продолжение из `.bak`; test_handoff_limit включает стресс-тест, но применяется
+    только после принятия первого шага, чтобы не блокировать его выполнение.
 
     Возвращает словарь итога:
-      status          — "completed" (все шаги приняты), "context_handoff" (контекст
-                        заполнен, состояние сохранено), "attempts_exhausted" (шаг не
-                        принят за отведённые попытки) или "error";
+      status          — "completed", "context_handoff", "attempts_exhausted",
+                        "interrupted" или "error";
       completed_steps / total_steps / stopped_at_step — где остановились;
       handoff_saved / handoff_path — что с файлом состояния;
-      tokens          — сколько токенов занимает основной чат на момент остановки;
+      tokens          — оценка размера основного чата на момент остановки;
       messages        — история основного чата.
     """
     task_text = _as_text(task).strip()
 
     # СТАРТ: Аналитик (ШАГ 4). handoff_text — содержимое handoff.md, если он был.
-    steps, handoff_text, plan_tokens = analyst_planner.build_execution_plan(
-        task_text, resume_backup=resume_backup
-    )
+    try:
+        steps, handoff_text, plan_tokens = analyst_planner.build_execution_plan(
+            task_text, resume_backup=resume_backup
+        )
+    except KeyboardInterrupt:
+        # Аналитик восстанавливает прочитанный primary при неудаче; при --resume
+        # исходный .bak также остаётся на месте. Сохраняем его, а не затираем новым
+        # черновиком, если прерывание случилось до начала выполнения шагов.
+        candidates = [_handoff_file_path()]
+        if resume_backup:
+            candidates.append(handoff_manager._backup_file_path())
+        for candidate in candidates:
+            try:
+                existing = handoff_manager.read_handoff_if_usable(candidate)
+            except Exception:
+                existing = None
+            if existing is not None:
+                _warn(
+                    f"построение плана прервано; существующий handoff {candidate} "
+                    "оставлен без изменений."
+                )
+                return {
+                    "status": "interrupted",
+                    "completed_steps": 0,
+                    "total_steps": 0,
+                    "stopped_at_step": 1,
+                    "handoff_saved": True,
+                    "handoff_path": str(candidate),
+                    "tokens": 0,
+                    "messages": [],
+                }
+        if not task_text:
+            # Если пригодной точки продолжения нет, новой исходной задачи тоже нет.
+            raise
+        # План ещё не получен, но исходная задача уже известна. Сохраняем её как
+        # незавершённый одношаговый план, не вызывая зависшую модель повторно.
+        return _stop_for_handoff(
+            task_text, [task_text], 0, [],
+            "Пользователь прервал работу во время построения плана. "
+            "Повтори запуск; исходная задача и незавершённый шаг сохранены.",
+            "interrupted", 0, use_model=False,
+        )
     if not task_text and handoff_text:
         # При возобновлении исходные требования берём из сохранённого раздела,
         # чтобы последующий handoff не заменил их сообщением о пустом аргументе.
@@ -959,6 +1083,15 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
     # не используется как основание отключать их до конца запуска.
     max_attempts = _max_attempts()
     step_idx = 0
+    completed_steps = 0
+    force_test_handoff = False
+    original_handoff_limit = getattr(team_config, "HANDOFF_TOKEN_LIMIT", None)
+    try:
+        stress_limit = int(test_handoff_limit) if test_handoff_limit is not None else None
+    except (TypeError, ValueError, OverflowError):
+        stress_limit = None
+    if stress_limit is not None and stress_limit < 1:
+        stress_limit = None
 
     print("\n" + "=" * 62)
     print("loop_team — ШАГ 5: главный цикл команды")
@@ -987,16 +1120,24 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
 
             # ВНУТРЕННИЙ ЦИКЛ: выполнение и ревью одного шага.
             while attempts < max_attempts:
-                # 1. Проверка контекста ПЕРЕД вызовом модели.
-                if team_config.is_context_critical(current_tokens):
+                # 1. Проверка контекста ПЕРЕД вызовом модели. В стресс-режиме
+                # Handoff принудительно срабатывает только после принятия первого
+                # шага — порог записи первого шага остаётся штатным.
+                context_critical = team_config.is_context_critical(current_tokens)
+                if context_critical or force_test_handoff:
                     limit = getattr(team_config, "HANDOFF_TOKEN_LIMIT", 0)
-                    return _stop_for_handoff(
-                        task_text, steps, step_idx, messages,
+                    blocker = (
+                        "Стресс-тест --test-handoff: первый шаг принят; сохраняю "
+                        "состояние перед началом второго шага."
+                        if force_test_handoff else
                         (
                             f"Контекст модели на исходе: использовано "
                             f"{current_tokens} токенов, порог Handoff — {limit}. "
                             f"Работа остановлена на шаге {step_idx + 1}: {step_text}"
-                        ),
+                        )
+                    )
+                    return _stop_for_handoff(
+                        task_text, steps, step_idx, messages, blocker,
                         "context_handoff", current_tokens,
                     )
 
@@ -1089,7 +1230,26 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
                             f"Очистка контекста: удалено сообщений: {removed} "
                             "(промежуточные сообщения неудачных попыток)"
                         )
+                        # Использование после pruning отличается от usage ответа,
+                        # который учитывал удалённую историю попыток.
+                        current_tokens = team_config.extract_used_tokens(None, messages)
                     step_accepted = True
+                    completed_steps = step_idx + 1
+                    if stress_limit is not None and completed_steps == 1:
+                        # Только теперь снижаем тестовый порог. До принятия первого
+                        # шага write_file располагает обычным контекстным бюджетом.
+                        try:
+                            post_step_limit = min(
+                                stress_limit, max(1, int(current_tokens))
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            post_step_limit = 1
+                        team_config.HANDOFF_TOKEN_LIMIT = post_step_limit
+                        force_test_handoff = True
+                        print(
+                            "Стресс-тест: первый шаг принят; порог Handoff временно "
+                            f"снижен до {post_step_limit} токенов."
+                        )
                     break
 
                 feedback = _as_text(review.get("feedback"))
@@ -1111,17 +1271,56 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False) -> dict:
                 )
 
             print(f"Шаг {step_idx + 1} принят. Перехожу к следующему.")
+    except KeyboardInterrupt:
+        _warn("пользователь прервал главный цикл; сохраняю handoff без повторного запроса к модели.")
+        if completed_steps >= len(steps):
+            # Ctrl+C пришёл после принятия последнего шага: незавершённой работы нет.
+            if handoff_text:
+                handoff_manager.archive_consumed_handoff(handoff_text)
+            return {
+                "status": "completed",
+                "completed_steps": len(steps),
+                "total_steps": len(steps),
+                "stopped_at_step": None,
+                "handoff_saved": False,
+                "handoff_path": str(_handoff_file_path()),
+                "tokens": current_tokens,
+                "messages": messages,
+            }
+        interrupted_step = min(completed_steps, max(0, len(steps) - 1))
+        return _stop_for_handoff(
+            task_text, steps, interrupted_step, messages,
+            (
+                "Пользователь прервал работу клавишей Ctrl+C. Сохраняю принятые "
+                f"шаги ({completed_steps} из {len(steps)}) и текущий незавершённый шаг."
+            ),
+            "interrupted", current_tokens, use_model=False,
+        )
     except Exception as exc:
-        # Непредвиденная ошибка: состояние всё равно должно быть сохранено.
+        # Непредвиденная ошибка: сохраняем следующий непринятый шаг, а не тот,
+        # который уже получил ПРИНЯТО (например, ошибка при печати после вердикта).
         _warn(
             f"непредвиденная ошибка главного цикла: {type(exc).__name__}: "
             f"{_truncate(_as_text(exc), 800)}"
         )
+        failed_step = min(completed_steps, max(0, len(steps) - 1))
         return _stop_for_handoff(
-            task_text, steps, step_idx, messages,
+            task_text, steps, failed_step, messages,
             f"Непредвиденная ошибка цикла: {type(exc).__name__}: {_as_text(exc)}",
             "error", current_tokens,
         )
+    finally:
+        if stress_limit is not None:
+            team_config.HANDOFF_TOKEN_LIMIT = original_handoff_limit
+
+    if handoff_text:
+        try:
+            handoff_manager.archive_consumed_handoff(handoff_text)
+        except Exception as exc:
+            _warn(
+                f"не удалось архивировать завершённый handoff: "
+                f"{type(exc).__name__}: {_truncate(_as_text(exc), 300)}"
+            )
 
     print("\n" + "=" * 62)
     print(f"ЗАДАЧА ВЫПОЛНЕНА: принято шагов {len(steps)} из {len(steps)}.")
@@ -1188,14 +1387,15 @@ def _offline_check() -> bool:
         touched: list = []
 
         # 1. Путь за пределами проекта должен отклоняться, а не выполняться.
-        outside, error = _safe_project_path("..\\..\\windows\\win.ini")
+        outside, error = _safe_project_path(Path("..") / ".." / "windows" / "win.ini")
         blocked = outside is None and bool(error)
         print(f"  путь вне проекта отклонён        : [{'OK' if blocked else 'ОШИБКА'}]")
         ok = ok and blocked
 
         # 2. Запись файла с кириллицей в UTF-8 и вложенной папкой.
         source = "# -*- coding: utf-8 -*-\nprint('привет')\n"
-        write_result = _tool_write_file({"path": "demo_pkg\\demo_mod.py",
+        demo_path = Path("demo_pkg") / "demo_mod.py"
+        write_result = _tool_write_file({"path": str(demo_path),
                                          "content": source}, touched)
         written = (temp_dir / "demo_pkg" / "demo_mod.py")
         try:
@@ -1216,7 +1416,7 @@ def _offline_check() -> bool:
         ok = ok and write_ok
 
         # 3. Чтение и перечисление.
-        read_result = _tool_read_file({"path": "demo_pkg\\demo_mod.py"})
+        read_result = _tool_read_file({"path": str(demo_path)})
         read_ok = "привет" in read_result
         print(f"  read_file читает файл            : [{'OK' if read_ok else 'ОШИБКА'}]")
         ok = ok and read_ok
@@ -1314,14 +1514,14 @@ def main() -> int:
     print("=" * 62)
     print("Исполнитель СОЗДАЁТ И МЕНЯЕТ файлы в папке проекта — это его работа.")
     print("Нужен запущенный локальный сервер модели (см. .env и .env.example).")
-    print("Остановка: Ctrl+C (загруженный handoff остаётся доступен в handoff.bak).")
+    print("Остановка: Ctrl+C (цикл сохранит handoff.md с текущим незавершённым шагом).")
     print(f"Задача: {_truncate(task, 300)}")
 
     try:
         result = run_team_loop(task, resume_backup=resume_backup)
     except KeyboardInterrupt:
         print("\n[ПРЕРВАНО] работа остановлена клавишей Ctrl+C.")
-        print("Новый handoff не создан. Если был загружен handoff, исходная точка остаётся в handoff.bak.")
+        print("Проверь handoff.md и handoff.bak: после начала шага цикл сохраняет текущую точку.")
         return 130
     except Exception as exc:  # последняя страховка: без голого traceback
         print(f"\n[ОШИБКА] цикл завершился непредвиденной ошибкой: "
@@ -1345,6 +1545,11 @@ def main() -> int:
             print("Это штатная остановка: продолжай работу новым запуском цикла.")
             return 0
         return 1
+    if status == "interrupted":
+        print(f"\nРЕЗУЛЬТАТ: работа прервана, {state_note}.")
+        if saved:
+            print("Продолжить сохранённое состояние можно запуском --resume.")
+        return 130
     if status == "attempts_exhausted":
         print(f"\nРЕЗУЛЬТАТ: шаг не принят ревьюером, {state_note}.")
         print("Что делать: открой handoff.md, прочитай замечания ревьюера и уточни")

@@ -6,6 +6,8 @@ __pycache__/
 # Файлы состояния механизма Handoff
 handoff.md
 handoff.bak
+handoff.md.completed*
+handoff.bak.*
 
 # Файлы, которые создаёт демонстрационный запуск главного цикла (ШАГ 5)
 demo_*.py

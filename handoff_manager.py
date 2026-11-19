@@ -1,7 +1,7 @@
 # Путь: F:\Projects\team_loop\handoff_manager.py
 # Назначение: ШАГ 3 — менеджер Handoff. Когда контекст локальной модели на исходе,
 #             сжимает состояние работы и сохраняет его в handoff.md; при восстановлении
-#             читает handoff.md, переименовывает его в handoff.bak и отдаёт текст в новый чат.
+#             читает handoff.md, переносит поколения .bak и отдаёт текст в новый чат.
 # Кодировка исходника: UTF-8 (в Python 3 она включена по умолчанию).
 """
 handoff_manager.py — ШАГ 3: менеджер Handoff (сохранение и восстановление работы).
@@ -19,9 +19,11 @@ handoff_manager.py — ШАГ 3: менеджер Handoff (сохранение 
         # Текущий контекст и блокер
     Результат записывается в handoff.md с encoding="utf-8".
   * load_handoff_if_exists() — если handoff.md читаемый и содержит четыре непустых
-    раздела, читает его, переименовывает в handoff.bak (старый .bak перезаписывается
-    через Path.replace) и возвращает текст; при явном запросе возобновления пустой,
+    раздела, читает его, переносит прежний .bak в .bak.1, архивирует основной файл
+    в handoff.bak и возвращает текст; при явном запросе возобновления пустой,
     нечитаемый или неполный основной файл не затирает пригодный .bak.
+  * archive_consumed_handoff() — после принятия всех шагов убирает использованную
+    копию из имён, автоматически читаемых через --resume, сохраняя её как .completed.
 
 Главный принцип этого шага: состояние работы теряться не должно. Поэтому, если модель
 не ответила (сервер выключен, таймаут) или ответ не соответствует шаблону, файл всё
@@ -84,6 +86,7 @@ __all__ = [
     "generate_handoff",
     "read_handoff_if_usable",
     "load_handoff_if_exists",
+    "archive_consumed_handoff",
 ]
 
 # ---------------------------------------------------------------------------
@@ -987,7 +990,8 @@ def _write_handoff_file(document: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def generate_handoff(task: str, plan: list[str], current_step_idx: int,
-                     recent_messages: list, blocker_reason: str) -> "str | None":
+                     recent_messages: list, blocker_reason: str, *,
+                     use_model: bool = True) -> "str | None":
     """Сохраняет состояние работы в handoff.md (ШАГ 3, п.1).
 
     Аргументы:
@@ -996,7 +1000,8 @@ def generate_handoff(task: str, plan: list[str], current_step_idx: int,
       plan              — список шагов плана;
       current_step_idx  — индекс текущего (незавершённого) шага, с нуля;
       recent_messages   — последние сообщения основного чата (обрезаются);
-      blocker_reason    — причина остановки: замечания ревьюера или переполнение контекста.
+      blocker_reason    — причина остановки: замечания ревьюера или переполнение контекста;
+    use_model         — False для Ctrl+C: собрать резервный handoff без нового запроса.
 
     Возвращает текст, записанный в handoff.md, или None, если записать не удалось
     (тогда в stderr уже написано русское объяснение причины).
@@ -1021,7 +1026,13 @@ def generate_handoff(task: str, plan: list[str], current_step_idx: int,
     messages_text = _messages_to_text(recent_messages)
 
     prompt = _build_handoff_messages(task_full, steps, step_idx, messages_text, blocker)
-    response, error = _call_local_model(prompt)
+    if use_model:
+        response, error = _call_local_model(prompt)
+    else:
+        # При Ctrl+C нельзя запускать ещё один запрос к той же зависающей модели.
+        # Резервные разделы ниже полностью строятся из задачи, плана и истории.
+        response = None
+        error = f"{MODEL_ERROR_PREFIX}запрос пропущен при остановке пользователя."
     model_error = _as_text(error)
     model_text = ""
     if error is None:
@@ -1144,26 +1155,65 @@ def read_handoff_if_usable(path: Path) -> "str | None":
     return text
 
 
-def _archive_handoff(path: Path) -> bool:
-    """Переименовывает handoff.md в handoff.bak, перезаписывая старый .bak.
+def _same_path(left: Path, right: Path) -> bool:
+    """Сравнивает нормализованные пути с учётом правил регистра текущей ОС."""
+    try:
+        return os.path.normcase(os.path.abspath(str(left))) == os.path.normcase(
+            os.path.abspath(str(right))
+        )
+    except (OSError, TypeError, ValueError):
+        return False
 
-    Path.replace (как и os.replace) на Windows заменяет существующий файл-приёмник,
-    поэтому старый handoff.bak не мешает. При неудаче исходный файл остаётся на диске:
-    переименование — это учёт, а потеря состояния работы недопустима.
+
+def _archive_previous_backup(backup: Path) -> tuple[bool, Path | None]:
+    """Сохраняет прежний `.bak` в `.bak.1`, не трогая его старую копию."""
+    previous = backup.with_name(backup.name + ".1")
+    if _same_path(previous, backup) or _same_path(previous, _handoff_file_path()):
+        _warn(
+            f"Путь предыдущей копии {previous} совпадает с одним из файлов состояния; "
+            "ротация handoff.bak отменена."
+        )
+        return False, None
+    try:
+        if not backup.exists():
+            return True, None
+        backup.replace(previous)
+        return True, previous
+    except (OSError, ValueError) as exc:
+        _warn(
+            f"Не удалось сохранить предыдущий handoff.bak в {previous}: "
+            f"{_as_text(exc.strerror) or exc}. Новый handoff не перемещён; исходный "
+            "handoff.md оставлен на диске."
+        )
+        return False, None
+
+
+def _archive_handoff(path: Path) -> bool:
+    """Перемещает handoff.md в handoff.bak, сохраняя ещё одно поколение в `.bak.1`.
+
+    Ротация выполняется до перемещения основного файла, но при неудаче второго шага
+    прежний `.bak` по возможности восстанавливается. Таким образом, старое состояние
+    не теряется, если новый handoff нельзя архивировать.
     """
     backup = _backup_file_path()
+    previous = backup.with_name(backup.name + ".1")
 
-    # Страховка от опечатки в .env: если HANDOFF_BACKUP указывает на сам handoff.md,
-    # replace просто уничтожил бы файл состояния.
-    try:
-        if os.path.normcase(str(backup)) == os.path.normcase(str(path)):
-            _warn(
-                "HANDOFF_BACKUP в .env совпадает с HANDOFF_FILE — переименование "
-                "удалило бы файл состояния. Оставляем handoff.md на диске; исправь "
-                "значения в .env (handoff.md и handoff.bak)."
-            )
-            return False
-    except (TypeError, ValueError):
+    # Страховка от опечатки в .env: переименование по совпадающему пути уничтожило бы
+    # единственный handoff. Заодно защищаем предыдущий архив от коллизии путей.
+    if _same_path(backup, path):
+        _warn(
+            "HANDOFF_BACKUP в .env совпадает с HANDOFF_FILE — переименование "
+            "удалило бы файл состояния. Оставляем handoff.md на диске; исправь "
+            "значения в .env (handoff.md и handoff.bak)."
+        )
+        return False
+    if _same_path(previous, path) or _same_path(previous, backup):
+        _warn(f"Путь предыдущей копии {previous} конфликтует с файлами handoff; "
+              "ротация отменена.")
+        return False
+
+    rotation_ok, rotated = _archive_previous_backup(backup)
+    if not rotation_ok:
         return False
 
     try:
@@ -1184,7 +1234,67 @@ def _archive_handoff(path: Path) -> bool:
             f"Не удалось переименовать {path} в {backup}: {reason}. handoff.md остался "
             "на диске, текст передан в работу."
         )
+    finally:
+        # Если старый `.bak` уже ротирован, а новый handoff не попал на его место,
+        # вернём старую активную копию. При наличии новой версии её не перезаписываем.
+        if rotated is not None:
+            try:
+                if not backup.exists() and rotated.exists():
+                    rotated.replace(backup)
+            except OSError as exc:
+                _warn(
+                    f"Не удалось восстановить старую копию {backup} из {rotated}: "
+                    f"{_as_text(exc.strerror) or exc}. Проверь оба файла вручную."
+                )
     return False
+
+
+def _unique_archive_path(path: Path, suffix: str) -> Path:
+    """Возвращает свободное имя архива рядом с исходным файлом."""
+    candidate = path.with_name(path.name + suffix)
+    index = 1
+    while candidate.exists():
+        candidate = path.with_name(path.name + suffix + f".{index}")
+        index += 1
+    return candidate
+
+
+def archive_consumed_handoff(expected_text: str) -> bool:
+    """Убирает завершённый handoff из автоматически возобновляемых имён.
+
+    `.bak` нужен для восстановления, пока задача выполняется. После принятия всех
+    шагов старая копия не должна запускаться снова по `--resume`; она перемещается
+    в соседний архив `*.completed` (без перезаписи предыдущих завершённых копий).
+    Перемещается только файл с тем же содержимым, которое действительно было
+    загружено, чтобы не затронуть более новое состояние.
+    """
+    expected = _as_text(expected_text)
+    if not expected:
+        return False
+
+    archived = False
+    candidates = (_handoff_file_path(), _backup_file_path())
+    visited: set[str] = set()
+    for path in candidates:
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key in visited:
+            continue
+        visited.add(key)
+        current = _read_handoff_text(path) if path.is_file() else None
+        if current != expected:
+            continue
+        try:
+            destination = _unique_archive_path(path, ".completed")
+            path.replace(destination)
+            _warn(f"Завершённый handoff перемещён в архив: {destination}.")
+            archived = True
+        except (OSError, ValueError) as exc:
+            _warn(
+                f"Не удалось убрать завершённый handoff {path} из доступных для --resume "
+                f"имён: {_as_text(exc.strerror) or exc}. Старое состояние оставлено "
+                "на диске без изменений."
+            )
+    return archived
 
 
 def load_handoff_if_exists(include_backup: bool = False) -> "str | None":
@@ -1419,13 +1529,18 @@ def _self_check() -> bool:
         print(f"  handoff.bak доступен для продолжения: [{'OK' if resumed else 'ОШИБКА'}]")
         ok = ok and resumed
 
-        print("\nШАГ ДЕМОНСТРАЦИИ 4. Второй handoff перезаписывает старый .bak:")
-        second = generate_handoff(task, plan, 1, messages, "Проверка перезаписи .bak.")
+        print("\nШАГ ДЕМОНСТРАЦИИ 4. Второй handoff обновляет .bak и сохраняет поколение .bak.1:")
+        first_backup_text = backup_path.read_text(encoding="utf-8")
+        second = generate_handoff(task, plan, 1, messages, "Проверка ротации .bak.")
         loaded_second = load_handoff_if_exists()
-        replaced = (second is not None and loaded_second is not None
-                    and backup_path.is_file())
-        print(f"  .bak перезаписан без ошибки: [{'OK' if replaced else 'ОШИБКА'}]")
-        ok = ok and replaced
+        previous_path = backup_path.with_name(backup_path.name + ".1")
+        rotated = (
+            second is not None and loaded_second is not None
+            and backup_path.is_file() and previous_path.is_file()
+            and previous_path.read_text(encoding="utf-8") == first_backup_text
+        )
+        print(f"  новая версия в .bak, старая в .bak.1: [{'OK' if rotated else 'ОШИБКА'}]")
+        ok = ok and rotated
 
     except OSError as exc:
         print(f"[ОШИБКА] не удалось подготовить временную папку: {exc}")
