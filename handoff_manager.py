@@ -18,9 +18,10 @@ handoff_manager.py — ШАГ 3: менеджер Handoff (сохранение 
         # Артефакты и файлы на диске
         # Текущий контекст и блокер
     Результат записывается в handoff.md с encoding="utf-8".
-  * load_handoff_if_exists() — если handoff.md есть, читает его, переименовывает
-    в handoff.bak (старый .bak перезаписывается через Path.replace) и возвращает текст;
-    если файла нет — возвращает None.
+  * load_handoff_if_exists() — если handoff.md читаемый и содержит четыре непустых
+    раздела, читает его, переименовывает в handoff.bak (старый .bak перезаписывается
+    через Path.replace) и возвращает текст; при явном запросе возобновления пустой,
+    нечитаемый или неполный основной файл не затирает пригодный .bak.
 
 Главный принцип этого шага: состояние работы теряться не должно. Поэтому, если модель
 не ответила (сервер выключен, таймаут) или ответ не соответствует шаблону, файл всё
@@ -81,6 +82,7 @@ __all__ = [
     "HANDOFF_HEADINGS",
     "HANDOFF_SYSTEM_PROMPT",
     "generate_handoff",
+    "read_handoff_if_usable",
     "load_handoff_if_exists",
 ]
 
@@ -1083,7 +1085,7 @@ def _read_handoff_text(path: Path) -> "str | None":
         reason = _as_text(exc.strerror) or _as_text(exc)
         _warn(
             f"Не удалось прочитать {path}: {reason}. Файл оставлен на диске без "
-            "изменений, работа продолжается без handoff."
+            "изменений; содержимое не использовано."
         )
         return None
 
@@ -1093,8 +1095,8 @@ def _read_handoff_text(path: Path) -> "str | None":
         reason = _as_text(exc.strerror) or _as_text(exc)
         _warn(
             f"{path} не читается ни как UTF-8, ни как CP1251: {reason}. Файл оставлен "
-            "на диске без изменений, работа продолжается без handoff. Открой его в "
-            "Блокноте и сохрани в кодировке UTF-8, после чего повтори запуск."
+            "на диске без изменений и не использован. Открой его в Блокноте и сохрани "
+            "в кодировке UTF-8, после чего повтори запуск."
         )
         return None
 
@@ -1103,6 +1105,42 @@ def _read_handoff_text(path: Path) -> "str | None":
         "быть искажена. Пересохраните файл в UTF-8 (Блокнот: «Сохранить как» -> "
         "Кодировка: UTF-8)."
     )
+    return text
+
+
+def read_handoff_if_usable(path: Path) -> "str | None":
+    """Читает непустой handoff без перемещения или изменения файла.
+
+    Используется точкой входа для проверки `--resume` до запуска модели и самим
+    загрузчиком при выборе между основным и резервным состоянием. Нечитаемый,
+    пустой или не содержащий всех четырёх непустых разделов файл не считается точкой
+    продолжения и никогда не архивируется поверх существующего `.bak`.
+    """
+    try:
+        if not path.is_file():
+            return None
+    except (OSError, ValueError) as exc:
+        _warn(f"Не удалось проверить наличие {path}: {_as_text(exc)}.")
+        return None
+
+    text = _read_handoff_text(path)
+    if text is None:
+        return None
+    if not text.strip():
+        _warn(f"{path} пуст — не использую его как точку продолжения.")
+        return None
+
+    sections = _split_into_sections(text)
+    missing = [
+        heading for heading in HANDOFF_HEADINGS
+        if not _as_text(sections.get(heading)).strip()
+    ]
+    if missing:
+        _warn(
+            f"{path} не подходит как точка продолжения: отсутствуют или пусты "
+            f"разделы {', '.join(missing)}. Файл оставлен без изменений."
+        )
+        return None
     return text
 
 
@@ -1150,47 +1188,40 @@ def _archive_handoff(path: Path) -> bool:
 
 
 def load_handoff_if_exists(include_backup: bool = False) -> "str | None":
-    """Читает handoff.md и убирает его с дороги (ШАГ 3, п.2).
+    """Читает используемое состояние Handoff (ШАГ 3, п.2).
 
-    Резервный handoff.bak читается только при явном запросе возобновления.
-    Обычный запуск без handoff.md возвращает None, чтобы старое состояние не
+    Читаемый `handoff.md` со всеми четырьмя непустыми разделами имеет приоритет и
+    архивируется в `.bak`. При явном возобновлении `include_backup=True` пустой,
+    нечитаемый или неполный основной файл не затирает пригодную резервную копию.
+    Обычный запуск не подхватывает резервную копию, чтобы старое состояние не
     перехватывало новые задачи.
     """
     path = _handoff_file_path()
     try:
-        exists = path.is_file()
-    except OSError:
-        # Недопустимый путь или недоступный диск: считаем, что handoff нет.
-        _warn(f"Не удалось проверить наличие {path} — работа продолжается без handoff.")
-        return None
+        primary_exists = path.is_file()
+    except (OSError, ValueError) as exc:
+        _warn(f"Не удалось проверить наличие {path}: {_as_text(exc)}.")
+        primary_exists = False
 
-    if not exists:
-        if not include_backup:
-            return None
-        backup = _backup_file_path()
-        try:
-            if backup.is_file():
-                return _read_handoff_text(backup)
-        except OSError:
-            _warn(f"Не удалось проверить резервный файл {backup}.")
-        return None
-
-    text = _read_handoff_text(path)
-    if text is None:
-        return None
-
-    if not text.strip():
-        # Пустой файл — продолжения в нём нет, а следующий запуск снова его подхватил
-        # бы и ушёл по кругу. Убираем в .bak и честно говорим, что стартуем заново.
-        _warn(
-            f"{path} пуст — продолжать в нём нечего. Переношу его в "
-            f"{_backup_file_path()} и начинаю работу по тексту задачи."
-        )
+    primary_text = read_handoff_if_usable(path) if primary_exists else None
+    if primary_text is not None:
         _archive_handoff(path)
-        return None
+        return primary_text
 
-    _archive_handoff(path)
-    return text
+    if include_backup:
+        backup = _backup_file_path()
+        backup_text = read_handoff_if_usable(backup)
+        if backup_text is not None:
+            if primary_exists:
+                _warn(
+                    f"Основной файл {path} непригоден; использую резервный "
+                    f"{backup} и оставляю основной файл без изменений."
+                )
+            return backup_text
+
+    # Не перемещаем пустой/нечитаемый основной файл в `.bak`: там может находиться
+    # единственная пригодная резервная копия. Для новой задачи он просто игнорируется.
+    return None
 
 
 # ---------------------------------------------------------------------------

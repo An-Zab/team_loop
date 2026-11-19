@@ -15,9 +15,9 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
   * `python run_strata_team.py --resume` — продолжение работы напрямую из
     `handoff.md` (или резервного `handoff.bak`), текст задачи вводить не нужно;
   * `python run_strata_team.py "Текст задачи" --test-handoff` — стресс-тест:
-    порог `HANDOFF_TOKEN_LIMIT` занижается до 800 токенов, чтобы Handoff
-    гарантированно сработал сразу после первого же шага и можно было за минуту
-    проверить, что `handoff.md` создаётся, а `--resume` его подхватывает.
+    порог `HANDOFF_TOKEN_LIMIT` занижается до 800 токенов; успех засчитывается
+    только если ровно первый шаг принят, цикл остановился на следующем и handoff
+    сохранён, иначе команда возвращает ошибку вместо ложного успеха.
 
 Сам цикл живёт в `loop_team.py` (ШАГ 5): он печатает номер шага, номер попытки,
 строки `[Used: X / Limit: Y]` и вердикт Ревьюера. Эта точка входа добавляет то,
@@ -32,13 +32,13 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
 меняется, руками ничего возвращать не нужно.
 
 Совместимость с Windows и защита от падения (правило 2 PLAN.md):
-  * pathlib.Path для путей; содержимое файлов эта точка входа не читает и не
-    пишет — только проверяет существование и размер handoff.md и handoff.bak;
+  * pathlib.Path для путей; перед `--resume` точка входа проверяет, что handoff
+    читаемый и содержит все четыре непустых раздела, но не изменяет его содержимое;
   * UTF-8 включается в stdout/stderr до импорта модулей проекта, чтобы русское
     сообщение о сломанном импорте было читаемым;
   * ошибки argparse печатаются по-русски с готовыми примерами запуска;
-  * запуск без задачи, `--resume` без `handoff.md` и `--resume` вместе с текстом
-    задачи останавливаются сразу — локальная модель не тратится впустую;
+  * запуск без задачи, `--resume` без пригодного `handoff.md` или `handoff.bak` и
+    `--resume` вместе с текстом задачи останавливаются сразу — модель не тратится впустую;
   * Ctrl+C и любая непредвиденная ошибка завершаются понятным русским текстом и
     кодом возврата, без голого traceback.
 """
@@ -84,6 +84,7 @@ _ensure_console_utf8()
 
 try:
     import team_config
+    import handoff_manager
     import loop_team
 except ImportError as _import_error:
     # Причина обычно одна: файл лежит не в папке проекта.
@@ -101,9 +102,9 @@ __all__ = ["main"]
 # ---------------------------------------------------------------------------
 
 # Порог Handoff для режима стресс-теста (--test-handoff) — ровно 800 токенов,
-# как требует ТЗ (PLAN.md, ШАГ 6, п.1). Столько не набирает даже короткий
-# системный промпт Исполнителя плюс один ответ модели, поэтому Handoff
-# срабатывает гарантированно и быстро.
+# как требует ТЗ (PLAN.md, ШАГ 6, п.1). Само понижение порога не гарантирует
+# Handoff после шага: ниже отдельно проверяется фактический статус, сохранение
+# файла и число принятых шагов.
 TEST_HANDOFF_TOKEN_LIMIT = 800
 
 # Коды возврата процесса: 0 — успех, 1 — работа не завершена,
@@ -282,8 +283,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             f"Стресс-тест Handoff: порог токенов занижается до "
-            f"{TEST_HANDOFF_TOKEN_LIMIT}, чтобы handoff.md создался сразу после "
-            "первого шага. Файл .env при этом не меняется."
+            f"{TEST_HANDOFF_TOKEN_LIMIT}; успех засчитывается только при сохранении "
+            "handoff после принятия ровно первого шага. Файл .env не меняется."
         ),
     )
     return parser
@@ -310,11 +311,9 @@ def _apply_test_handoff_limit() -> None:
     print(f"Действующий порог      : {effective} "
           f"(MAX_CONTEXT_TOKENS = {_config_int('MAX_CONTEXT_TOKENS', 0)})")
     print("Это только текущий запуск: файл .env не изменён, после выхода всё вернётся.")
-    print("Ожидаемое поведение: цикл выполнит первый шаг, упрётся в порог,")
-    print("создаст handoff.md и штатно остановится.")
-    print("Примечание: при таком пороге Исполнителю остаётся мало места, поэтому")
-    print("он может не успеть записать большой файл — для проверки Handoff это")
-    print("нормально, важнее сам факт создания handoff.md и остановки.")
+    print("Успех: ровно первый шаг принят, затем цикл штатно остановился и сохранил handoff.")
+    print("Если порог достигнут до принятия шага, после нескольких шагов или задача")
+    print("завершилась без Handoff, тест вернёт код 1; проверь размер шага и настройки модели.")
     if effective < TEST_HANDOFF_TOKEN_LIMIT:
         print("[ВНИМАНИЕ] MAX_CONTEXT_TOKENS меньше 800, поэтому порог зажат до")
         print(f"{effective} — Handoff сработает ещё раньше.")
@@ -325,7 +324,7 @@ def _check_arguments(task: str, resume: bool) -> str:
     if resume and task:
         return (
             "[ОШИБКА] флаг --resume нельзя совмещать с текстом новой задачи.\n"
-            "Продолжение берёт исходную задачу из handoff.md. Выбери одно:\n"
+            "Продолжение берёт исходную задачу из handoff.md или handoff.bak. Выбери одно:\n"
             "  продолжить работу : python run_strata_team.py --resume\n"
             '  новая задача        : python run_strata_team.py "Текст задачи"\n'
             "(перед новой задачей уберите старый handoff.md с дороги — иначе цикл\n"
@@ -341,18 +340,39 @@ def _check_arguments(task: str, resume: bool) -> str:
 
 
 def _check_state(resume: bool, handoff_path: Path, backup_path: Path) -> str:
-    """Проверяет файлы состояния ДО обращения к модели.
+    """Проверяет пригодность файлов состояния ДО обращения к модели.
 
-    Возвращает текст ошибки, из-за которой запуск бессмысленен, или пустую строку.
-    Предупреждения печатает сразу и не мешают работе.
+    Возвращает текст ошибки, если продолжать не из чего, или пустую строку.
+    Проверка не перемещает и не изменяет файлы; повреждённый основной handoff не
+    должен затереть пригодную резервную копию.
     """
     handoff_exists = _is_file(handoff_path)
-    backup_exists = _is_file(backup_path)
+    try:
+        handoff_text = handoff_manager.read_handoff_if_usable(handoff_path)
+    except Exception as exc:
+        print(f"[ВНИМАНИЕ] не удалось проверить {handoff_path}: "
+              f"{type(exc).__name__}: {_truncate(_as_text(exc), 300)}")
+        handoff_text = None
 
-    if resume and not handoff_exists and not backup_exists:
+    if resume:
+        backup_text = None
+        if not handoff_text:
+            try:
+                backup_text = handoff_manager.read_handoff_if_usable(backup_path)
+            except Exception as exc:
+                print(f"[ВНИМАНИЕ] не удалось проверить {backup_path}: "
+                      f"{type(exc).__name__}: {_truncate(_as_text(exc), 300)}")
+
+        if handoff_text:
+            return ""
+        if backup_text:
+            print("[ВНИМАНИЕ] основной handoff отсутствует или непригоден; продолжение")
+            print(f"будет взято из резервного файла: {backup_path}.")
+            return ""
+
         return (
             "[ОШИБКА] продолжать работу не из чего: handoff.md и handoff.bak "
-            "не найдены.\n"
+            "не найдены или непригодны (пусты, не читаются или содержат неполный шаблон).\n"
             "Проверенные пути:\n"
             f"  {handoff_path}\n"
             f"  {backup_path}\n"
@@ -361,13 +381,17 @@ def _check_state(resume: bool, handoff_path: Path, backup_path: Path) -> str:
             '  python run_strata_team.py "Текст задачи"'
         )
 
-    if not resume and handoff_exists:
+    if handoff_text:
         print("[ВНИМАНИЕ] в папке проекта уже есть handoff.md "
               f"({_read_size(handoff_path)}).")
         print("Аналитик (ШАГ 4) продолжит работу из него, а текст новой задачи")
         print("будет проигнорирован — так устроен механизм Handoff.")
         print("Начать задачу с нуля можно, убрав файл с дороги, например так:")
         print(f'  Move-Item "{handoff_path}" "{handoff_path}.old"')
+        print()
+    elif handoff_exists:
+        print(f"[ВНИМАНИЕ] основной handoff непригоден: {handoff_path}")
+        print("Он будет проигнорирован; сохранённый handoff.bak не изменяется.")
         print()
 
     return ""
@@ -391,11 +415,19 @@ def _print_startup_info(task: str, resume: bool, test_handoff: bool,
     print("run_strata_team.py — ШАГ 6: запуск цикла команды")
     print("=" * 62)
     print(f"Режим запуска         : {mode}")
-    print(f"Задача                : {_truncate(task or '(из handoff.md)', PRINT_TASK_CHARS)}")
+    task_label = task or "(из handoff.md или handoff.bak)"
+    print(f"Задача                : {_truncate(task_label, PRINT_TASK_CHARS)}")
     print(f"MODEL_NAME            : {getattr(team_config, 'MODEL_NAME', '')}")
     print(f"OPENAI_BASE_URL       : {getattr(team_config, 'OPENAI_BASE_URL', '')}")
-    print(f"MAX_CONTEXT_TOKENS    : {_config_int('MAX_CONTEXT_TOKENS', 0)}")
-    print(f"HANDOFF_TOKEN_LIMIT   : {_current_handoff_limit()}")
+    max_context = _config_int("MAX_CONTEXT_TOKENS", 0)
+    active_limit = _current_handoff_limit()
+    if test_handoff:
+        active_limit = (
+            min(TEST_HANDOFF_TOKEN_LIMIT, max_context)
+            if max_context >= 1 else TEST_HANDOFF_TOKEN_LIMIT
+        )
+    print(f"MAX_CONTEXT_TOKENS    : {max_context}")
+    print(f"HANDOFF_TOKEN_LIMIT   : {active_limit}")
     print(f"MAX_STEP_ATTEMPTS     : {_config_int('MAX_STEP_ATTEMPTS', 3)}")
     print(f"handoff.md            : {handoff_path} "
           f"[{'есть, ' + _read_size(handoff_path) if _is_file(handoff_path) else 'нет'}]")
@@ -456,8 +488,27 @@ def _print_summary(result: dict) -> int:
 
     if status == "attempts_exhausted":
         print("\nРезультат             : шаг не принят ревьюером, попытки исчерпаны")
-        print("Открой handoff.md, прочитай раздел «# Текущий контекст и блокер»")
-        print("и поставь задачу конкретнее (или меньше по объёму), затем:")
+        try:
+            state_path = Path(handoff_path)
+            if not state_path.is_absolute():
+                state_path = _MODULE_DIR / state_path
+            remaining_handoff = handoff_manager.read_handoff_if_usable(state_path)
+            state_checked = True
+        except Exception as exc:
+            remaining_handoff = None
+            state_checked = False
+            print(f"[ВНИМАНИЕ] не удалось проверить {handoff_path}: "
+                  f"{type(exc).__name__}: {_truncate(_as_text(exc), 300)}")
+
+        if remaining_handoff is not None or not state_checked:
+            print(f"Открой {handoff_path} и прочитай раздел «# Текущий контекст и блокер».")
+            print("Перед новой задачей убери этот handoff с дороги — иначе цикл")
+            print("может продолжить старый план вместо предложенного запуска:")
+            print(f'  Move-Item "{handoff_path}" "{handoff_path}.old"')
+        else:
+            print("Пригодного handoff.md не осталось; новая задача не будет")
+            print("перехвачена старым состоянием.")
+        print("Затем сформулируй задачу конкретнее (или уменьши её объём):")
         print('  python run_strata_team.py "Уточнённый текст задачи"')
         return EXIT_FAILED
 
@@ -466,6 +517,50 @@ def _print_summary(result: dict) -> int:
     if saved:
         print("Состояние сохранено в handoff.md — можно продолжить: --resume")
     return EXIT_FAILED
+
+
+def _validate_test_handoff_result(result: dict, fallback_path: Path) -> tuple[bool, str]:
+    """Проверяет, что после ровно одного принятого шага Handoff сохранён и пригоден."""
+    if not isinstance(result, dict):
+        return False, "цикл не вернул словарь результата"
+    status = _as_text(result.get("status"))
+    if status != "context_handoff":
+        return False, f"цикл завершился со статусом {status or 'unknown'}, а не context_handoff"
+    if not bool(result.get("handoff_saved")):
+        return False, "цикл сообщил, что handoff не сохранён"
+    completed = _as_int(result.get("completed_steps"), 0)
+    if completed != 1:
+        if completed < 1:
+            return False, (
+                "Handoff сработал до принятия первого шага "
+                f"(принято шагов: {completed})"
+            )
+        return False, (
+            "Handoff сработал не сразу после первого принятого шага "
+            f"(принято шагов: {completed})"
+        )
+    total = _as_int(result.get("total_steps"), 0)
+    stopped_at = _as_int(result.get("stopped_at_step"), 0)
+    if total < 2 or stopped_at != 2:
+        return False, (
+            "цикл не подтвердил штатную остановку на следующем шаге после первого "
+            f"(шагов в плане: {total}, остановка на шаге: {stopped_at})"
+        )
+
+    reported_path = _as_text(result.get("handoff_path")).strip()
+    try:
+        path = Path(reported_path) if reported_path else fallback_path
+        if not path.is_absolute():
+            path = _MODULE_DIR / path
+        saved_text = handoff_manager.read_handoff_if_usable(path)
+    except Exception as exc:
+        return False, (
+            f"не удалось проверить сохранённый handoff: {type(exc).__name__}: "
+            f"{_truncate(_as_text(exc), 300)}"
+        )
+    if saved_text is None:
+        return False, f"файл handoff отсутствует, непригоден или не читается: {path}"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -522,12 +617,18 @@ def main() -> int:
     code = _print_summary(result)
 
     if test_handoff:
+        passed, reason = _validate_test_handoff_result(result, handoff_path)
         print("\n" + "-" * 62)
-        print("СТРЕСС-ТЕСТ ЗАВЕРШЁН.")
-        print(f"1. Открой handoff.md — он должен существовать: {handoff_path}")
-        print("2. Проверь продолжение работы командой:")
-        print("     python run_strata_team.py --resume")
-        print("3. Обычные лимиты вернутся сами: просто запусти без --test-handoff.")
+        if passed:
+            print("СТРЕСС-ТЕСТ ПРОЙДЕН: после принятия первого шага Handoff сохранён.")
+            print(f"1. Открой handoff.md: {handoff_path}")
+            print("2. Проверь продолжение работы командой:")
+            print("     python run_strata_team.py --resume")
+            print("3. Обычные лимиты вернутся сами: просто запусти без --test-handoff.")
+        else:
+            print(f"[ОШИБКА] СТРЕСС-ТЕСТ НЕ ПРОЙДЕН: {reason}.")
+            print("Успех требует сохранённого handoff после принятия хотя бы одного шага.")
+            code = EXIT_FAILED
         print("-" * 62)
 
     return code
