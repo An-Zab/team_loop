@@ -569,6 +569,10 @@ def _build_plan_messages(user_task: str, handoff_text: "str | None") -> list:
 
     Ветки две (ТЗ, ШАГ 4, п.1): с handoff модель ищет только оставшиеся шаги,
     без handoff — разбивает исходную задачу на атомарные последовательные шаги.
+
+    Текст задачи при наличии handoff не выбрасывается: это уточнение человека
+    («продолжи выполнение задачи», «сначала почини тесты»). Без этого блока
+    напечатанный при возобновлении промпт доходил бы только до консоли.
     """
     if handoff_text:
         user_text = (
@@ -584,6 +588,13 @@ def _build_plan_messages(user_task: str, handoff_text: "str | None") -> list:
             "- если невыполненных шагов нет, верни пустой JSON-массив [].\n\n"
             "Формат ответа — JSON-массив строк: [\"Шаг 1\", \"Шаг 2\"]"
         )
+        note = _as_text(user_task).strip()
+        if note:
+            user_text += (
+                "\n\nУточнение пользователя к возобновлению работы (учти его, но "
+                "не выдумывай из него новых шагов, если оно противоречит handoff):\n"
+                f"{_truncate(note, MAX_TASK_CHARS)}"
+            )
         return [
             {"role": "system", "content": ANALYST_SYSTEM_PROMPT},
             {"role": "user", "content": user_text},

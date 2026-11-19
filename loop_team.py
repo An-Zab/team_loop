@@ -16,15 +16,20 @@ loop_team.py — ШАГ 5: модернизация главного цикла 
   * Внешний цикл по шагам плана: `for step_idx, step_text in enumerate(plan)`.
     Перед шагом запоминается длина истории `history_checkpoint`.
   * Внутренний цикл `while attempts < MAX_STEP_ATTEMPTS`:
-      1. Проверка контекста ПЕРЕД вызовом: `is_context_critical(current_tokens)`
-         -> `generate_handoff(...)`, уведомление в консоль, штатная остановка.
+      1. Проверка контекста ПЕРЕД вызовом (страховка) -> Handoff и остановка.
       2. Вызов Исполнителя: `step_text` и `feedback` ревьюера (если попытки > 0).
          Исполнитель читает и пишет файлы стандартными инструментами
          read_file / write_file / list_files.
       3. Обновление `current_tokens` через `extract_used_tokens(...)`.
       4. Вызов Изолированного Ревьюера: `review_step(step_text, отчёт, файлы)`.
-      5. Вердикт: ПРИНЯТО -> очистка памяти (Context Pruning) при attempts > 0 и
-         переход к следующему шагу; ДОРАБОТАТЬ -> attempts += 1 и новый `feedback`.
+         Ревьюер — отдельный stateless-запрос, основной чат он НЕ увеличивает.
+      5. Вердикт: ПРИНЯТО -> очистка памяти (Context Pruning) при attempts > 0;
+         ДОРАБОТАТЬ -> attempts += 1 и новый `feedback`.
+      6. ОБЯЗАТЕЛЬНЫЙ HANDOFF по завершении работы роли: если контекст заполнен
+         на 60 % и больше (`is_context_critical`), цикл пишет `handoff.md` и
+         штатно останавливается, продолжая работу в чистом чате. Проверка
+         выполняется и после принятого шага (тогда он уже помечен `[x]`, и новый
+         чат продолжает со СЛЕДУЮЩЕГО шага), и после незакрытой попытки.
   * Аварийный выход по попыткам: `generate_handoff(...)` с описанием блокера и
     остановка выполнения.
 
@@ -360,6 +365,73 @@ def _remaining_file_write_limit(messages: list) -> int:
         return MAX_FILE_WRITE_CHARS
     remaining_tokens = max(0, handoff_limit - used_tokens)
     return min(MAX_FILE_WRITE_CHARS, remaining_tokens * divisor)
+
+
+def _handoff_limit() -> int:
+    """Действующий порог Handoff (60 % окна) в момент вызова."""
+    try:
+        return int(team_config._effective_handoff_limit())
+    except Exception:
+        return 0
+
+
+def _trigger_ratio() -> float:
+    """Доля контекста, при которой обязателен Handoff (по умолчанию 0.60)."""
+    try:
+        return float(getattr(team_config, "HANDOFF_TRIGGER_RATIO", 0.60))
+    except (TypeError, ValueError):
+        return 0.60
+
+
+def _fill_percent(current_tokens: int) -> float:
+    """Сколько процентов порога Handoff уже занято."""
+    try:
+        return float(team_config.context_fill_percent(current_tokens))
+    except Exception:
+        return 0.0
+
+
+def _context_line(current_tokens: int) -> str:
+    """Одна и та же строка заполнения контекста для всех сообщений цикла.
+
+    Показывает токены, порог Handoff и проценты реального окна модели: человеку
+    видно, сколько осталось до обязательного перехода в чистый чат.
+    """
+    return (
+        f"[Used: {current_tokens} / Limit: {_handoff_limit()}] "
+        f"контекст {_fill_percent(current_tokens):.0f} % "
+        f"(Handoff с {_trigger_ratio() * 100:.0f} %)"
+    )
+
+
+def _max_context_tokens() -> int:
+    """Полный размер контекстного окна в момент вызова."""
+    try:
+        return int(getattr(team_config, "MAX_CONTEXT_TOKENS", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _handoff_blocker(current_tokens: int, step_idx: int, step_text: str, *,
+                     forced: bool = False, accepted: bool = False) -> str:
+    """Один и тот же текст блокера для консоли и handoff.md во всех случаях Handoff."""
+    if forced:
+        return (
+            "Стресс-тест --test-handoff: первый шаг принят; сохраняю состояние "
+            "перед началом следующего шага."
+        )
+    done = (
+        " Шаг уже принят ревьюером и помечен в плане выполненным — продолжай со "
+        "следующего."
+        if accepted else ""
+    )
+    return (
+        f"Контекст модели заполнен на {_fill_percent(current_tokens):.0f} % "
+        f"(использовано {current_tokens} из {_max_context_tokens()} токенов), "
+        f"порог Handoff — {_trigger_ratio() * 100:.0f} % "
+        f"({_handoff_limit()} токенов). Работа остановлена на шаге "
+        f"{step_idx + 1}: {step_text}.{done}"
+    )
 
 
 def _handoff_file_path() -> Path:
@@ -951,22 +1023,27 @@ def _prune_step_history(messages: list, checkpoint: int, final_report: str) -> i
 
 def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list,
                       blocker: str, status: str, current_tokens: int, *,
-                      use_model: bool = True) -> dict:
+                      use_model: bool = True, step_completed: bool = False) -> dict:
     """Сохраняет handoff.md, уведомляет консоль и формирует итог остановки.
 
-    Используется в трёх случаях из ТЗ: контекст критичен, попытки исчерпаны,
-    непредвиденная ошибка. Работа всегда завершается штатно: без traceback и без
-    потерянного состояния.
+    Случаи остановки: контекст заполнен на 60 % и больше (правило Handoff),
+    attempts исчерпаны, Ctrl+C, непредвиденная ошибка.
+
+    `step_completed=True` означает, что шаг уже получил вердикт ПРИНЯТО: в
+    `handoff.md` он помечен `[x]`, а точка продолжения указывает на следующий
+    шаг. Иначе новый чат перерабатывал бы уже сделанную и принятую работу.
     """
     print("\n" + "=" * 62)
-    print("СОХРАНЯЮ СОСТОЯНИЕ В handoff.md И ОСТАНАВЛИВАЮСЬ")
+    print("СОХРАНЯЮ СОСТОЯНИЕ В handoff.md И ПЕРЕХОЖУ В ЧИСТЫЙ ЧАТ")
     print(f"Причина: {blocker}")
     print("=" * 62)
+
+    done_idx = step_idx + 1 if step_completed else step_idx
 
     document = None
     try:
         document = handoff_manager.generate_handoff(
-            task_text, steps, step_idx, messages, blocker, use_model=use_model
+            task_text, steps, done_idx, messages, blocker, use_model=use_model
         )
     except Exception as exc:  # сохранение не должно ронять цикл
         _warn(
@@ -978,7 +1055,7 @@ def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list
     saved = document is not None
     if saved:
         print(f"handoff.md сохранён: {handoff_path}")
-        print("Продолжить работу можно запуском цикла из Шага 6 — он подхватит этот файл.")
+        print("Продолжи работу в чистом чате: `python start_team.py` -> «продолжаем старую».")
     else:
         print(
             "handoff.md НЕ сохранён (причина напечатана выше). Проверь, не открыт ли "
@@ -987,9 +1064,9 @@ def _stop_for_handoff(task_text: str, steps: list, step_idx: int, messages: list
 
     return {
         "status": status,
-        "completed_steps": step_idx,
+        "completed_steps": done_idx,
         "total_steps": len(steps),
-        "stopped_at_step": step_idx + 1,
+        "stopped_at_step": done_idx + 1,
         "handoff_saved": saved,
         "handoff_path": str(handoff_path),
         "tokens": current_tokens,
@@ -1062,16 +1139,25 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
             "Повтори запуск; исходная задача и незавершённый шаг сохранены.",
             "interrupted", 0, use_model=False,
         )
-    if not task_text and handoff_text:
+    if handoff_text:
         # При возобновлении исходные требования берём из сохранённого раздела,
-        # чтобы последующий handoff не заменил их сообщением о пустом аргументе.
+        # чтобы следующий handoff не записал в «# Исходная задача» ни пустой
+        # аргумент, ни короткое «продолжи выполнение задачи» вместо настоящих
+        # требований. Уточнение человека при этом не теряется.
         match = re.search(
             r"(?ms)^# Исходная задача\s*\n(.*?)(?=^# |\Z)", handoff_text
         )
-        if match:
-            task_text = match.group(1).strip()
-            if task_text.startswith("Текст исходной задачи не передан"):
-                task_text = ""
+        original = match.group(1).strip() if match else ""
+        if original.startswith("Текст исходной задачи не передан"):
+            original = ""
+        note = task_text
+        if original and note and note != original:
+            task_text = (
+                f"{original}\n\nУточнение пользователя при возобновлении работы: "
+                f"{note}"
+            )
+        elif original:
+            task_text = original
     handoff_note = _handoff_summary(handoff_text)
 
     messages: list = [{"role": "system", "content": _build_executor_system(handoff_note)}]
@@ -1101,7 +1187,9 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
     print(f"Handoff подхвачен : {'да' if handoff_text else 'нет'}")
     print(f"Токены Аналитика  : {plan_tokens}")
     print(f"Попыток на шаг    : {max_attempts}")
-    print(f"Лимит Handoff     : {getattr(team_config, 'HANDOFF_TOKEN_LIMIT', 0)} токенов")
+    print(f"Порог Handoff     : {_handoff_limit()} токенов "
+          f"({_trigger_ratio() * 100:.0f} % от {_max_context_tokens()}) — "
+          "при его достижении обязателен handoff и чистый чат")
 
     try:
         # ВНЕШНИЙ ЦИКЛ: по шагам плана.
@@ -1120,70 +1208,34 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
 
             # ВНУТРЕННИЙ ЦИКЛ: выполнение и ревью одного шага.
             while attempts < max_attempts:
-                # 1. Проверка контекста ПЕРЕД вызовом модели. В стресс-режиме
-                # Handoff принудительно срабатывает только после принятия первого
-                # шага — порог записи первого шага остаётся штатным.
-                context_critical = team_config.is_context_critical(current_tokens)
-                if context_critical or force_test_handoff:
-                    limit = getattr(team_config, "HANDOFF_TOKEN_LIMIT", 0)
-                    blocker = (
-                        "Стресс-тест --test-handoff: первый шаг принят; сохраняю "
-                        "состояние перед началом второго шага."
-                        if force_test_handoff else
-                        (
-                            f"Контекст модели на исходе: использовано "
-                            f"{current_tokens} токенов, порог Handoff — {limit}. "
-                            f"Работа остановлена на шаге {step_idx + 1}: {step_text}"
-                        )
-                    )
+                # ПРОВЕРКА ПЕРЕД ВЫЗОВОМ — страховка: порог мог оказаться превышен
+                # ещё до начала шага (например, длинной сводкой handoff).
+                # В стресс-режиме Handoff принудительно срабатывает только после
+                # принятия первого шага — бюджет записи первого шага штатный.
+                if force_test_handoff or team_config.is_context_critical(current_tokens):
                     return _stop_for_handoff(
-                        task_text, steps, step_idx, messages, blocker,
+                        task_text, steps, step_idx, messages,
+                        _handoff_blocker(current_tokens, step_idx, step_text,
+                                         forced=force_test_handoff),
                         "context_handoff", current_tokens,
                     )
 
                 attempts += 1
                 print(
                     f"\nПопытка {attempts} из {max_attempts} "
-                    f"[Used: {current_tokens} / Limit: "
-                    f"{getattr(team_config, 'HANDOFF_TOKEN_LIMIT', 0)}]"
+                    f"{_context_line(current_tokens)}"
                 )
 
-                # 2. Вызов Исполнителя (цель шага и замечания ревьюера).
+                # 1. Вызов Исполнителя (цель шага и замечания ревьюера).
                 step_message = _build_step_message(step_text, feedback)
                 report, response = _run_executor(
                     messages, step_message, touched_files
                 )
 
-                # 3. Обновление current_tokens по реальному ответу сервера.
+                # 2. Обновление current_tokens по реальному ответу сервера.
                 current_tokens = team_config.extract_used_tokens(response, messages)
-                if team_config.is_context_critical(current_tokens):
-                    objective_report = isolated_reviewer.run_objective_checks(
-                        touched_files
-                    )
-                    verified_files = (
-                        "Файлы Исполнителя проверены: " + ", ".join(
-                            _relative_display(path) for path in touched_files
-                        )
-                        if touched_files else
-                        "Исполнитель не передал ни одного пути к файлу; "
-                        "проверяемых артефактов нет."
-                    )
-                    return _stop_for_handoff(
-                        task_text, steps, step_idx, messages,
-                        (
-                            f"Контекст достиг порога Handoff внутри попытки: "
-                            f"{current_tokens} токенов; остановка перед следующим "
-                            "вызовом модели. Объективная проверка файлового состояния "
-                            f"перед остановкой: {verified_files} {objective_report}. "
-                            "Отчёт Исполнителя перед остановкой: "
-                            f"{_truncate(report, MAX_FEEDBACK_CHARS)}"
-                        ),
-                        "context_handoff", current_tokens,
-                    )
                 print(
-                    f"Ответ Исполнителя получен "
-                    f"[Used: {current_tokens} / Limit: "
-                    f"{getattr(team_config, 'HANDOFF_TOKEN_LIMIT', 0)}], "
+                    f"Ответ Исполнителя получен {_context_line(current_tokens)}, "
                     f"затронутых файлов: {len(touched_files)}"
                 )
                 # Начало отчёта показываем целиком в свёрнутом виде: человеку видно,
@@ -1191,8 +1243,11 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
                 preview = _truncate(" ".join(report.split()), 300)
                 print(f"Начало отчёта Исполнителя: {preview}")
 
-                # 4. Вызов Изолированного Ревьюера (ШАГ 2) — отдельным stateless
-                #    запросом, без истории основного чата.
+                # 3. Вызов Изолированного Ревьюера (ШАГ 2) — отдельным stateless-
+                #    запросом без истории основного чата. Ревьюер НЕ увеличивает
+                #    основной чат, поэтому вызывается всегда, даже когда контекст
+                #    уже на пороге: шаг, доделанный на исходе окна, обязан получить
+                #    вердикт, а не переделываться в новом чате заново.
                 if response is None:
                     review = {
                         "accepted": False,
@@ -1220,7 +1275,7 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
                     f"(отдельный запрос: {review_tokens} токенов)"
                 )
 
-                # 5. Оценка вердикта.
+                # 4. Оценка вердикта.
                 if accepted:
                     if attempts > 1:
                         removed = _prune_step_history(
@@ -1250,6 +1305,20 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
                             "Стресс-тест: первый шаг принят; порог Handoff временно "
                             f"снижен до {post_step_limit} токенов."
                         )
+
+                    # ОБЯЗАТЕЛЬНЫЙ HANDOFF по завершении работы Исполнителя:
+                    # контекст заполнен на 60 % и больше -> обновляем handoff.md
+                    # (принятый шаг уже помечен [x]) и уходим в чистый чат.
+                    if (force_test_handoff
+                            or team_config.is_context_critical(current_tokens)):
+                        return _stop_for_handoff(
+                            task_text, steps, step_idx, messages,
+                            _handoff_blocker(current_tokens, step_idx, step_text,
+                                             forced=force_test_handoff,
+                                             accepted=True),
+                            "context_handoff", current_tokens,
+                            step_completed=True,
+                        )
                     break
 
                 feedback = _as_text(review.get("feedback"))
@@ -1257,6 +1326,17 @@ def run_team_loop(task: str = "", *, resume_backup: bool = False,
                 print("Замечания ревьюера:")
                 for line in short_feedback.splitlines():
                     print(f"  | {line}")
+
+                # ОБЯЗАТЕЛЬНЫЙ HANDOFF и после незакрытой попытки: шаг остаётся
+                # незавершённым — именно его и продолжаем в чистом чате.
+                if team_config.is_context_critical(current_tokens):
+                    return _stop_for_handoff(
+                        task_text, steps, step_idx, messages,
+                        _handoff_blocker(current_tokens, step_idx, step_text)
+                        + " Последние замечания ревьюера: "
+                        + (_truncate(feedback, MAX_FEEDBACK_CHARS) or "замечаний нет"),
+                        "context_handoff", current_tokens,
+                    )
 
             if not step_accepted:
                 # АВАРИЙНЫЙ ВЫХОД ПО ПОПЫТКАМ: шаг не принят, дальше идти нельзя.
@@ -1374,7 +1454,9 @@ def _offline_check() -> bool:
     print(f"MODEL_NAME         : {getattr(team_config, 'MODEL_NAME', '')}")
     print(f"OPENAI_BASE_URL    : {getattr(team_config, 'OPENAI_BASE_URL', '')}")
     print(f"MAX_STEP_ATTEMPTS  : {_max_attempts()}")
-    print(f"HANDOFF_TOKEN_LIMIT: {getattr(team_config, 'HANDOFF_TOKEN_LIMIT', 0)}")
+    print(f"MAX_CONTEXT_TOKENS : {_max_context_tokens()}")
+    print(f"HANDOFF_TOKEN_LIMIT: {_handoff_limit()} "
+          f"({_trigger_ratio() * 100:.0f} % окна — правило чистого чата)")
     print(f"Папка проекта      : {_project_dir()}")
     print("-" * 62)
 

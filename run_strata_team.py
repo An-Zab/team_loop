@@ -10,14 +10,22 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
 Удобная кнопка «Запустить» для автономного цикла движка Strata
 (Аналитик -> Исполнитель <-> Изолированный Ревьюер, механизм Handoff).
 
-Три режима запуска (см. PLAN.md, ШАГ 6, п.1):
+Четыре режима запуска (см. PLAN.md, ШАГ 6, п.1):
   * `python run_strata_team.py "Текст задачи"` — обычный запуск цикла;
   * `python run_strata_team.py --resume` — продолжение работы напрямую из
     `handoff.md` (или резервного `handoff.bak`), текст задачи вводить не нужно;
+  * `python run_strata_team.py --resume "Продолжи выполнение задачи"` — то же
+    самое, но модель получает ещё и уточнение человека; текст рядом с `--resume`
+    больше не считается ошибкой параметров;
   * `python run_strata_team.py "Текст задачи" --test-handoff` — стресс-тест:
     первый шаг выполняется с обычным бюджетом записи; только после его принятия
-    тестовый порог снижается (не выше 800), и перед вторым шагом вызывается штатный
-    Handoff. Успех требует одного принятого шага и сохранённого файла состояния.
+    тестовый порог снижается (не выше 800), и цикл проходит ту же ветку
+    обязательного Handoff. Успех требует одного принятого шага и сохранённого файла.
+
+Правило Handoff (ШАГ 5, п.6): по завершении работы роли при заполнении 60 % и
+более контекста цикл обновляет `handoff.md` и останавливается; продолжать работу
+нужно в чистом чате. Имя модели и размер её контекста в `.env` подставляет
+`start_team.py` — руками их переключать под вторую модель не приходится.
 
 Сам цикл живёт в `loop_team.py` (ШАГ 5): он печатает номер шага, номер попытки,
 строки `[Used: X / Limit: Y]` и вердикт Ревьюера. Эта точка входа добавляет то,
@@ -38,8 +46,8 @@ run_strata_team.py — ШАГ 6: точка входа и режим стрес�
   * UTF-8 включается в stdout/stderr до импорта модулей проекта, чтобы русское
     сообщение о сломанном импорте было читаемым;
   * ошибки argparse печатаются по-русски с готовыми примерами запуска;
-  * запуск без задачи, `--resume` без пригодного `handoff.md` или `handoff.bak` и
-    `--resume` вместе с текстом задачи останавливаются сразу — модель не тратится впустую;
+  * запуск без задачи и `--resume` без пригодного `handoff.md` или `handoff.bak`
+    останавливаются сразу — модель не тратится впустую;
   * Ctrl+C и любая непредвиденная ошибка завершаются понятным русским текстом и
     кодом возврата, без голого traceback.
 """
@@ -153,6 +161,14 @@ def _config_int(name: str, default: int) -> int:
     return _as_int(getattr(team_config, name, default), default)
 
 
+def _config_float(name: str, default: float) -> float:
+    """Вещественная настройка Шага 1 (HANDOFF_TRIGGER_RATIO) в момент вызова."""
+    try:
+        return float(getattr(team_config, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _current_handoff_limit() -> int:
     """Действующий порог Handoff с тем же зажимом, что и в Шаге 1.
 
@@ -221,8 +237,10 @@ def _read_size(path: Path) -> str:
 def _print_usage_examples() -> None:
     """Печатает готовые к копированию примеры запуска — их можно вставить как есть."""
     print("Как запускать (текст задачи — в кавычках):")
+    print("  python start_team.py")
     print('  python run_strata_team.py "Создай модуль calc.py со сложением и вычитанием"')
     print("  python run_strata_team.py --resume")
+    print('  python run_strata_team.py --resume "Продолжи выполнение задачи"')
     print('  python run_strata_team.py "Собери модуль calc.py" --test-handoff')
     print("  python run_strata_team.py --help")
 
@@ -255,8 +273,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "Примеры:\n"
             '  python run_strata_team.py "Создай модуль calc.py со сложением и вычитанием"\n'
             "  python run_strata_team.py --resume\n"
+            '  python run_strata_team.py --resume "Продолжи выполнение задачи"\n'
             '  python run_strata_team.py "Собери модуль calc.py" --test-handoff\n\n'
-            "Нужен запущенный локальный сервер модели (адрес и имя — в файле .env)."
+            "Правило Handoff: по завершении работы любой роли при заполнении 60 %\n"
+            "и более контекста цикл обновляет handoff.md и останавливается —\n"
+            "продолжать работу нужно в чистом чате.\n\n"
+            "Нужен запущенный локальный сервер модели; имя модели и размер его\n"
+            "контекста в .env подставляет `python start_team.py`."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -273,8 +296,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help=(
-            "Продолжить работу из handoff.md (или резервного handoff.bak) без текста "
-            "задачи."
+            "Продолжить работу из handoff.md (или резервного handoff.bak). "
+            "Текст рядом с флагом не обязателен; если он передан, модель "
+            "получит его как уточнение к возобновлению."
         ),
     )
     parser.add_argument(
@@ -315,15 +339,6 @@ def _announce_test_handoff_mode() -> None:
 
 def _check_arguments(task: str, resume: bool) -> str:
     """Проверяет сочетания параметров. Возвращает текст ошибки или пустую строку."""
-    if resume and task:
-        return (
-            "[ОШИБКА] флаг --resume нельзя совмещать с текстом новой задачи.\n"
-            "Продолжение берёт исходную задачу из handoff.md или handoff.bak. Выбери одно:\n"
-            "  продолжить работу : python run_strata_team.py --resume\n"
-            '  новая задача        : python run_strata_team.py "Текст задачи"\n'
-            "(перед новой задачей уберите старый handoff.md с дороги — иначе цикл\n"
-            "продолжит работу из него, а не начнёт новую задачу)"
-        )
     if not resume and not task:
         return (
             "[ОШИБКА] не передан текст задачи и не указан флаг --resume.\n"
@@ -378,10 +393,12 @@ def _check_state(resume: bool, handoff_path: Path, backup_path: Path) -> str:
     if handoff_text:
         print("[ВНИМАНИЕ] в папке проекта уже есть handoff.md "
               f"({_read_size(handoff_path)}).")
-        print("Аналитик (ШАГ 4) продолжит работу из него, а текст новой задачи")
-        print("будет проигнорирован — так устроен механизм Handoff.")
+        print("Аналитик (ШАГ 4) продолжит работу ИЗ НЕГО; текст задачи будет")
+        print("передан как уточнение к возобновлению, а не как новая задача.")
         print("Начать задачу с нуля можно, убрав файл с дороги, например так:")
         print(f'  Move-Item "{handoff_path}" "{handoff_path}.old"')
+        print("Или запусти `python start_team.py` и выбери «новая задача» —")
+        print("там handoff.md и handoff.bak убираются сами.")
         print()
     elif handoff_exists:
         print(f"[ВНИМАНИЕ] основной handoff непригоден: {handoff_path}")
@@ -415,8 +432,13 @@ def _print_startup_info(task: str, resume: bool, test_handoff: bool,
     print(f"OPENAI_BASE_URL       : {getattr(team_config, 'OPENAI_BASE_URL', '')}")
     max_context = _config_int("MAX_CONTEXT_TOKENS", 0)
     active_limit = _current_handoff_limit()
+    ratio = _config_float("HANDOFF_TRIGGER_RATIO", 0.60)
     print(f"MAX_CONTEXT_TOKENS    : {max_context}")
-    print(f"HANDOFF_TOKEN_LIMIT   : {active_limit}")
+    print(f"HANDOFF_TOKEN_LIMIT   : {active_limit} "
+          f"({ratio * 100:.0f} % окна — правило чистого чата)")
+    if max_context >= 1:
+        print(f"Порог в процентах     : {active_limit * 100.0 / max_context:.0f} % "
+              f"от {max_context} токенов")
     if test_handoff:
         test_limit = (
             min(TEST_HANDOFF_TOKEN_LIMIT, max_context)
@@ -451,6 +473,8 @@ def _print_summary(result: dict) -> int:
     handoff_path = _as_text(result.get("handoff_path")).strip() or str(_handoff_paths()[0])
     tokens = _as_int(result.get("tokens"), 0)
     limit = _current_handoff_limit()
+    max_context = _config_int("MAX_CONTEXT_TOKENS", 0)
+    fill = f" ({tokens * 100.0 / max_context:.0f} % окна)" if max_context >= 1 else ""
 
     print("\n" + "=" * 62)
     print("ИТОГ ЗАПУСКА")
@@ -458,7 +482,7 @@ def _print_summary(result: dict) -> int:
     print(f"Шагов принято         : {completed} из {total}")
     if stopped_at is not None:
         print(f"Остановка на шаге      : {stopped_at}")
-    print(f"Токены основного чата : [Used: {tokens} / Limit: {limit}]")
+    print(f"Токены основного чата : [Used: {tokens} / Limit: {limit}]{fill}")
     if status == "completed":
         print("Результат             : задача выполнена, все шаги приняты ревьюером")
         print(f"Файл состояния        : handoff.md не создавался ({handoff_path})")
@@ -471,9 +495,11 @@ def _print_summary(result: dict) -> int:
         return EXIT_OK
 
     if status == "context_handoff":
-        print("\nРезультат             : контекст модели заполнен, работа перенесена")
+        print("\nРезультат             : контекст заполнен на 60 % и больше, работа перенесена")
         if saved:
-            print("Это штатная остановка. Продолжи работу той же командой:")
+            print("Это штатная остановка правила Handoff. Продолжи работу в ЧИСТОМ")
+            print("чате той же командой:")
+            print("  python start_team.py        -> «продолжаем старую» [N]")
             print("  python run_strata_team.py --resume")
             print("Открой handoff.md — там задача, статус плана и что делать первым.")
             return EXIT_OK
@@ -485,6 +511,7 @@ def _print_summary(result: dict) -> int:
         print("\nРезультат             : работа прервана клавишей Ctrl+C")
         if saved:
             print("Точка продолжения сохранена. Возобнови работу командой:")
+            print("  python start_team.py        -> «продолжаем старую» [N]")
             print("  python run_strata_team.py --resume")
         else:
             print("Не удалось сохранить новую точку продолжения; проверь сообщение выше.")
@@ -506,8 +533,9 @@ def _print_summary(result: dict) -> int:
 
         if remaining_handoff is not None or not state_checked:
             print(f"Открой {handoff_path} и прочитай раздел «# Текущий контекст и блокер».")
-            print("Перед новой задачей убери этот handoff с дороги — иначе цикл")
-            print("может продолжить старый план вместо предложенного запуска:")
+            print("Перед новой задачей убери этот handoff с дороги — проще всего через")
+            print('`python start_team.py` -> «работаем с новой задачей [Y]».')
+            print("Вручную:")
             print(f'  Move-Item "{handoff_path}" "{handoff_path}.old"')
         else:
             print("Пригодного handoff.md не осталось; новая задача не будет")

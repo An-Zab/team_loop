@@ -7,11 +7,17 @@ team_config.py — ШАГ 1: конфигурация и утилиты подс
 
 Возможности (см. PLAN.md, ШАГ 1):
   * Загрузка настроек из `.env` (`OPENAI_BASE_URL`, `OPENAI_API_KEY`,
-    `MODEL_NAME`) с дефолтными значениями; лимиты переопределяются через `.env`.
-  * Пороги токенов для механизма Handoff и максимум попыток одного шага.
+    `MODEL_NAME`, `MAX_CONTEXT_TOKENS`) с дефолтными значениями.
+  * ОДНО правило Handoff: контекст заполнен на 60 % и больше
+    (`HANDOFF_TRIGGER_RATIO * MAX_CONTEXT_TOKENS`) — завершённая роль обязана
+    обновить handoff.md и продолжить работу в чистом чате. Порог больше не
+    настраивается отдельно: он всегда вычислен из `MAX_CONTEXT_TOKENS`, а его
+    подставляет `start_team.py` из ответа сервера. Переключать под вторую модель
+    руками в `.env` больше нечего.
   * extract_used_tokens()  — получение использованных токенов из ответа сервера
     (с приближённым подсчётом по сообщениям, если сервер не вернул `usage`).
-  * is_context_critical()  — сигнал о том, что контекст приближается к Handoff.
+  * is_context_critical()  — сигнал о том, что пора делать Handoff и уходить в
+    чистый чат; context_fill_percent() — те же проценты для строк лога.
 
 Совместимость с Windows:
   * pathlib.Path, явный encoding="utf-8" при записи файлов;
@@ -36,7 +42,6 @@ from __future__ import annotations
 import codecs
 import io
 import json
-import math
 import os
 import re
 from pathlib import Path
@@ -47,7 +52,7 @@ __all__ = [
     "OPENAI_API_KEY",
     "MODEL_NAME",
     "MAX_CONTEXT_TOKENS",
-    "HANDOFF_FREE_RATIO",
+    "HANDOFF_TRIGGER_RATIO",
     "HANDOFF_TOKEN_LIMIT",
     "MAX_STEP_ATTEMPTS",
     "TOKEN_ESTIMATE_DIVISOR",
@@ -55,6 +60,7 @@ __all__ = [
     "HANDOFF_BACKUP",
     "extract_used_tokens",
     "is_context_critical",
+    "context_fill_percent",
 ]
 
 # ---------------------------------------------------------------------------
@@ -434,23 +440,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        val = float(raw.strip())
-        if math.isnan(val) or math.isinf(val):
-            _warn(f"Переменная {name}={raw!r} имеет некорректное числовое значение; "
-                  f"использую дефолт {default}.")
-            return default
-        return val
-    except ValueError:
-        _warn(f"Переменная {name}={raw!r} не является числом; "
-              f"использую дефолт {default}.")
-        return default
-
-
 def _env_path(name: str, default: str) -> Path:
     """Путь из окружения; относительные значения привязываем к каталогу модуля.
 
@@ -489,7 +478,7 @@ MODEL_NAME: str = _env_str("MODEL_NAME", "qwen-local")
 # Дефолты и границы, к которым возвращаемся при некорректных значениях в .env.
 _DEFAULT_MAX_CONTEXT_TOKENS = 32768
 _MIN_CONTEXT_TOKENS = 1
-_MAX_ALLOWED_CONTEXT_TOKENS = 131072  # 128K токенов — практический максимум локальных моделей (Qwen 2.5/Llama 3)
+_MAX_ALLOWED_CONTEXT_TOKENS = 1048576  # 1M токенов — потолок проверки; start_team.py подставляет реальный n_ctx сервера
 _DEFAULT_MAX_STEP_ATTEMPTS = 3
 
 # Полный размер контекстного окна локальной модели.
@@ -500,30 +489,26 @@ if not _MIN_CONTEXT_TOKENS <= MAX_CONTEXT_TOKENS <= _MAX_ALLOWED_CONTEXT_TOKENS:
           f"использую дефолт {_DEFAULT_MAX_CONTEXT_TOKENS}.")
     MAX_CONTEXT_TOKENS = _DEFAULT_MAX_CONTEXT_TOKENS
 
-# Доля контекста, которую нужно оставить свободной (порог срабатывания Handoff).
-HANDOFF_FREE_RATIO: float = _env_float("HANDOFF_FREE_RATIO", 0.25)
-if not 0.0 < HANDOFF_FREE_RATIO < 1.0:
-    _warn(f"HANDOFF_FREE_RATIO={HANDOFF_FREE_RATIO} вне диапазона (0; 1); "
-          f"использую дефолт 0.25.")
-    HANDOFF_FREE_RATIO = 0.25
+# Единственное правило Handoff: как только контекст заполнен на 60 % и больше,
+# завершённая роль ОБЯЗАНА обновить handoff.md и продолжить работу в чистом чате.
+# Доля зашита в код, а не в .env: модель одна за запуск, и переключать под неё
+# приходится только MAX_CONTEXT_TOKENS (его подставляет start_team.py).
+HANDOFF_TRIGGER_RATIO: float = 0.60
 
 
 def _handoff_limit_from_ratio() -> int:
-    """Порог Handoff по формуле ТЗ: int(MAX * (1 - HANDOFF_FREE_RATIO))."""
+    """Порог Handoff: 60 % контекстного окна, то есть 0.6 * MAX_CONTEXT_TOKENS."""
     max_tokens = MAX_CONTEXT_TOKENS
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
         max_tokens = _DEFAULT_MAX_CONTEXT_TOKENS
-    ratio = HANDOFF_FREE_RATIO
-    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or not (0.0 < ratio < 1.0):
-        ratio = 0.25
-    return min(max(int(max_tokens * (1.0 - ratio)), 1), max_tokens)
+    return min(max(int(max_tokens * HANDOFF_TRIGGER_RATIO), 1), max_tokens)
 
 
 def _effective_handoff_limit() -> int:
     """Возвращает действующий порог Handoff, зажатый в 1..MAX_CONTEXT_TOKENS.
 
-    Защищает от рантайм-присваивания некорректных значений (HANDOFF_TOKEN_LIMIT = 0
-    или порог больше размера окна).
+    Порог — глобальная переменная модуля: стресс-тест `--test-handoff` понижает
+    её на время своего запуска, поэтому читаем значение в момент вызова.
     """
     limit = HANDOFF_TOKEN_LIMIT
     if not isinstance(limit, int) or isinstance(limit, bool):
@@ -538,22 +523,8 @@ def _effective_handoff_limit() -> int:
 
 
 # Расчётный порог токенов: при его достижении пора делать Handoff.
-# Может быть явно переопределён в .env (например, для стресс-теста Шага 6).
-HANDOFF_TOKEN_LIMIT: int = _env_int(
-    "HANDOFF_TOKEN_LIMIT",
-    _handoff_limit_from_ratio(),
-)
-if not 1 <= HANDOFF_TOKEN_LIMIT <= MAX_CONTEXT_TOKENS:
-    _fixed_limit = _handoff_limit_from_ratio()
-    # Порог 0 означал бы «контекст критичен всегда»: цикл Шага 5 уходил бы в
-    # Handoff до первого вызова Исполнителя, а --resume зацикливал бы
-    # handoff.md -> план -> снова критично. Порог больше окна наоборот означал
-    # бы, что Handoff не сработает никогда и контекст переполнится ошибкой
-    # сервера.
-    _warn(f"HANDOFF_TOKEN_LIMIT={HANDOFF_TOKEN_LIMIT} вне осмысленного диапазона "
-          f"1..{MAX_CONTEXT_TOKENS} (MAX_CONTEXT_TOKENS); пересчитываю по формуле: "
-          f"{_fixed_limit}.")
-    HANDOFF_TOKEN_LIMIT = _fixed_limit
+# Напрямую не настраивается — всегда 60 % от MAX_CONTEXT_TOKENS.
+HANDOFF_TOKEN_LIMIT: int = _handoff_limit_from_ratio()
 
 # Максимум попыток исправления одного шага плана.
 MAX_STEP_ATTEMPTS: int = _env_int("MAX_STEP_ATTEMPTS", _DEFAULT_MAX_STEP_ATTEMPTS)
@@ -730,18 +701,35 @@ def extract_used_tokens(api_response, messages_fallback: list) -> int:
 
 
 def is_context_critical(current_tokens: int) -> bool:
-    """True, если использовано уже не меньше HANDOFF_TOKEN_LIMIT токенов.
+    """True, если контекст заполнен на 60 % и больше — пора в чистый чат.
 
-    Константа читается как глобальная переменная модуля в момент вызова с
-    защитным клампом в диапазон 1..MAX_CONTEXT_TOKENS (чтобы рантайм-занижение
-    порога, например в стресс-тесте Шага 6, не привело к значению 0 или
-    порогу больше размера окна).
+    Порог равен `HANDOFF_TOKEN_LIMIT` и всегда составляет
+    `HANDOFF_TRIGGER_RATIO * MAX_CONTEXT_TOKENS`. Константа читается как
+    глобальная переменная модуля в момент вызова с защитным клампом в диапазон
+    1..MAX_CONTEXT_TOKENS (стресс-тест Шага 6 понижает её на время своего
+    запуска, и порог не должен стать нулём или больше самого окна).
     """
     try:
         cur = int(current_tokens)
     except (TypeError, ValueError):
         cur = 0
     return cur >= _effective_handoff_limit()
+
+
+def context_fill_percent(current_tokens: int) -> float:
+    """Сколько процентов контекстного окна занято (для строк лога и итога).
+
+    Знаменатель — `MAX_CONTEXT_TOKENS`, то есть реальное окно модели, а не порог
+    Handoff: человек мыслит именно заполнением контекста («62 % — уже за 60 %»).
+    """
+    maximum = MAX_CONTEXT_TOKENS
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+        maximum = _DEFAULT_MAX_CONTEXT_TOKENS
+    try:
+        cur = int(current_tokens)
+    except (TypeError, ValueError):
+        cur = 0
+    return cur * 100.0 / maximum
 
 
 # ---------------------------------------------------------------------------
@@ -760,9 +748,10 @@ if __name__ == "__main__":
     print(f"OPENAI_API_KEY        : {'(задан)' if OPENAI_API_KEY else '(пуст)'}")
     print("-" * 62)
     print(f"MAX_CONTEXT_TOKENS    : {MAX_CONTEXT_TOKENS}")
-    print(f"HANDOFF_FREE_RATIO    : {HANDOFF_FREE_RATIO}")
+    print(f"HANDOFF_TRIGGER_RATIO : {HANDOFF_TRIGGER_RATIO} "
+          f"(правило Handoff: 60 % заполненного контекста)")
     print(f"HANDOFF_TOKEN_LIMIT   : {HANDOFF_TOKEN_LIMIT} "
-          f"(Handoff при ~{HANDOFF_TOKEN_LIMIT / MAX_CONTEXT_TOKENS:.0%} заполнении контекста)")
+          f"(Handoff при {HANDOFF_TOKEN_LIMIT / MAX_CONTEXT_TOKENS:.0%} заполнении контекста)")
     print(f"MAX_STEP_ATTEMPTS     : {MAX_STEP_ATTEMPTS}")
     print(f"TOKEN_ESTIMATE_DIVISOR: {TOKEN_ESTIMATE_DIVISOR} "
           f"(запасная оценка: len(text) // {TOKEN_ESTIMATE_DIVISOR})")
@@ -794,13 +783,16 @@ if __name__ == "__main__":
     print(f"  is_context_critical: limit-1={below}, limit={at}, limit+1={above} "
           f"[{status_crit}]")
 
-    expected_limit = int(MAX_CONTEXT_TOKENS * (1 - HANDOFF_FREE_RATIO))
-    status_formula = "OK" if (HANDOFF_TOKEN_LIMIT == expected_limit or "HANDOFF_TOKEN_LIMIT" in os.environ) else "ОШИБКА"
-    print(f"  HANDOFF_TOKEN_LIMIT соответствует формуле ТЗ ({expected_limit}) "
-          f"[{status_formula}]")
+    expected_limit = int(MAX_CONTEXT_TOKENS * HANDOFF_TRIGGER_RATIO)
+    status_formula = "OK" if HANDOFF_TOKEN_LIMIT == expected_limit else "ОШИБКА"
+    print(f"  HANDOFF_TOKEN_LIMIT = {HANDOFF_TRIGGER_RATIO:.0%} от "
+          f"MAX_CONTEXT_TOKENS ({expected_limit}) [{status_formula}]")
 
     in_range = 1 <= HANDOFF_TOKEN_LIMIT <= MAX_CONTEXT_TOKENS
     print(f"  HANDOFF_TOKEN_LIMIT в диапазоне 1..{MAX_CONTEXT_TOKENS} "
           f"[{'OK' if in_range else 'ОШИБКА'}]")
+    pct = context_fill_percent(HANDOFF_TOKEN_LIMIT)
+    print(f"  context_fill_percent(порог) = {pct:.0f} % от окна "
+          f"[{'OK' if abs(pct - HANDOFF_TRIGGER_RATIO * 100) < 1.0 else 'ОШИБКА'}]")
     print(f"  HANDOFF_FILE абсолютный (не зависит от cwd) "
           f"[{'OK' if HANDOFF_FILE.is_absolute() else 'ОШИБКА'}]")

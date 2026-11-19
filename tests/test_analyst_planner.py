@@ -171,5 +171,31 @@ class TestHandoffPlanTransaction(unittest.TestCase):
         self.model.assert_not_called()
 
 
+class TestResumeNoteInPrompt(unittest.TestCase):
+    """Текст рядом с --resume должен доходить до модели, а не только до консоли."""
+
+    def test_note_is_appended_to_the_handoff_branch(self):
+        messages = planner._build_plan_messages(
+            "Сначала почини тесты", HANDOFF
+        )
+        user_text = messages[1]["content"]
+
+        self.assertIn("Содержимое handoff.md", user_text)
+        self.assertIn("Уточнение пользователя к возобновлению работы", user_text)
+        self.assertIn("Сначала почини тесты", user_text)
+
+    def test_empty_note_adds_no_block(self):
+        with_note = planner._build_plan_messages("", HANDOFF)[1]["content"]
+
+        self.assertNotIn("Уточнение пользователя", with_note)
+        self.assertIn("Содержимое handoff.md", with_note)
+
+    def test_without_handoff_the_text_is_still_the_task(self):
+        user_text = planner._build_plan_messages("Создать модуль", None)[1]["content"]
+
+        self.assertIn("Создать модуль", user_text)
+        self.assertNotIn("Содержимое handoff.md", user_text)
+
+
 if __name__ == "__main__":
     unittest.main()

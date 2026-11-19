@@ -163,6 +163,91 @@ class TestLoopHandoffState(unittest.TestCase):
     def _accepted_review(self):
         return {"accepted": True, "feedback": "ПРИНЯТО", "review_tokens": 1}
 
+    @staticmethod
+    def _execute(tokens):
+        """Фабрика Исполнителя: дописывает историю и возвращает фиксированный usage."""
+
+        def execute(messages, step_message, touched_files):
+            messages.extend([
+                {"role": "user", "content": step_message},
+                {"role": "assistant", "content": "Шаг выполнен."},
+            ])
+            return "Шаг выполнен.", model_response(tokens)
+
+        return execute
+
+    @staticmethod
+    def _extract(response, messages):
+        """Начальная оценка системы — 10 токенов, далее честный usage сервера."""
+        if response is None:
+            return 10
+        return response["usage"]["total_tokens"]
+
+    def test_accepted_step_at_sixty_percent_saves_handoff_and_marks_step_done(self):
+        """Принятый шаг на 60 % контекста: handoff обновлён, шаг закрыт [x]."""
+        with patch.object(team_config, "HANDOFF_TOKEN_LIMIT", 100), \
+                patch.object(team_config, "extract_used_tokens",
+                             side_effect=self._extract), \
+                patch.object(loop_team.analyst_planner, "build_execution_plan",
+                             return_value=(["Шаг один", "Шаг два"], None, 0)), \
+                patch.object(loop_team, "_run_executor", side_effect=self._execute(240)), \
+                patch.object(loop_team.isolated_reviewer, "review_step",
+                             return_value=self._accepted_review()), \
+                patch.object(loop_team.handoff_manager, "generate_handoff",
+                             return_value="сохранено") as handoff:
+            result = loop_team.run_team_loop("Задача")
+
+        self.assertEqual(result["status"], "context_handoff")
+        self.assertTrue(result["handoff_saved"])
+        # Исполнитель вызван ровно один раз: второй шаг в этом чате не начинается.
+        self.assertEqual(result["completed_steps"], 1)
+        self.assertEqual(result["stopped_at_step"], 2)
+        # В handoff передан номер СЛЕДУЮЩЕГО шага, то есть «Шаг один» помечен [x].
+        self.assertEqual(handoff.call_args.args[2], 1)
+        self.assertIn("порог Handoff", handoff.call_args.args[4])
+
+    def test_rejected_attempt_at_sixty_percent_saves_handoff_with_open_step(self):
+        """Незакрытая попытка на 60 %: handoff, но шаг остаётся [ ]."""
+        with patch.object(team_config, "HANDOFF_TOKEN_LIMIT", 100), \
+                patch.object(team_config, "extract_used_tokens",
+                             side_effect=self._extract), \
+                patch.object(loop_team.analyst_planner, "build_execution_plan",
+                             return_value=(["Шаг один", "Шаг два"], None, 0)), \
+                patch.object(loop_team, "_run_executor", side_effect=self._execute(240)), \
+                patch.object(loop_team.isolated_reviewer, "review_step",
+                             return_value={"accepted": False, "feedback": "Доработай",
+                                           "review_tokens": 1}), \
+                patch.object(loop_team.handoff_manager, "generate_handoff",
+                             return_value="сохранено") as handoff:
+            result = loop_team.run_team_loop("Задача")
+
+        self.assertEqual(result["status"], "context_handoff")
+        self.assertEqual(result["completed_steps"], 0)
+        self.assertEqual(result["stopped_at_step"], 1)
+        self.assertEqual(handoff.call_args.args[2], 0)
+        self.assertIn("Доработай", handoff.call_args.args[4])
+
+    def test_resume_note_does_not_replace_the_original_task(self):
+        """Уточнение при возобновлении не должно вытеснить исходную задачу."""
+        with patch.object(team_config, "HANDOFF_TOKEN_LIMIT", 100), \
+                patch.object(team_config, "extract_used_tokens",
+                             side_effect=self._extract), \
+                patch.object(loop_team.analyst_planner, "build_execution_plan",
+                             return_value=(["Шаг один", "Шаг два"], VALID_HANDOFF, 0)), \
+                patch.object(loop_team, "_run_executor", side_effect=self._execute(240)), \
+                patch.object(loop_team.isolated_reviewer, "review_step",
+                             return_value=self._accepted_review()), \
+                patch.object(loop_team.handoff_manager, "generate_handoff",
+                             return_value="сохранено") as handoff:
+            result = loop_team.run_team_loop("Продолжи выполнение задачи")
+
+        self.assertEqual(result["status"], "context_handoff")
+        saved_task = handoff.call_args.args[0]
+        # Настоящие требования из handoff.md остались дословно...
+        self.assertIn("Завершить проект", saved_task)
+        # ...а уточнение человека присоединено, а не заменило их.
+        self.assertIn("Продолжи выполнение задачи", saved_task)
+
     def test_test_handoff_keeps_first_step_budget_then_stops_on_next_step(self):
         observed_limits = []
 
@@ -230,11 +315,14 @@ class TestLoopHandoffState(unittest.TestCase):
             result = loop_team.run_team_loop("Задача")
 
         self.assertEqual(result["status"], "completed")
-        # Проверки до попыток: шаг 1 — 10 токенов, шаг 2 после pruning — 25,
-        # а не устаревшие 1300 токенов от ответа до удаления истории.
-        self.assertEqual(critical_inputs[0], 10)
-        self.assertEqual(critical_inputs[3], 1300)  # последняя попытка до pruning
-        self.assertEqual(critical_inputs[4], 25)  # новый шаг после пересчёта
+        # Порядок проверок после перехода на обязательный Handoff по завершении
+        # работы роли: решение всегда принимается по токенам ПОСЛЕ Context Pruning,
+        # устаревшие 1300 токенов из ответа до удаления истории больше не участвуют.
+        self.assertEqual(critical_inputs[0], 10)    # страховка перед попыткой 1 шага 1
+        self.assertEqual(critical_inputs[1], 900)   # попытка 1 не принята -> проверка после неё
+        self.assertEqual(critical_inputs[2], 900)   # страховка перед попыткой 2
+        self.assertEqual(critical_inputs[3], 25)    # шаг принят: уже после pruning
+        self.assertEqual(critical_inputs[4], 25)    # новый шаг стартует с той же оценки
         self.assertEqual(none_call_count, 2)
 
     def test_ctrl_c_saves_state_and_marks_already_accepted_steps_complete(self):
@@ -268,16 +356,43 @@ class TestLoopHandoffState(unittest.TestCase):
         self.assertFalse(handoff.call_args.kwargs["use_model"])
 
     def test_interrupt_while_planning_saves_new_task_without_model_retry(self):
-        with patch.object(loop_team.analyst_planner, "build_execution_plan",
-                          side_effect=KeyboardInterrupt), \
-                patch.object(loop_team.handoff_manager, "generate_handoff",
-                             return_value="сохранено") as handoff:
-            result = loop_team.run_team_loop("Новая задача")
+        # Путь к handoff уводим во временную папку: без этого тест зависел бы от
+        # настоящего handoff.md в папке проекта. Если он там есть и пригоден,
+        # цикл честно оставляет его и не вызывает generate_handoff, и тест
+        # падал бы на пустом mock'е независимо от качества кода.
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "handoff.md"
+            with patch.object(loop_team.analyst_planner, "build_execution_plan",
+                              side_effect=KeyboardInterrupt), \
+                    patch.object(loop_team, "_handoff_file_path",
+                                 return_value=missing), \
+                    patch.object(loop_team.handoff_manager, "generate_handoff",
+                                 return_value="сохранено") as handoff:
+                result = loop_team.run_team_loop("Новая задача")
 
         self.assertEqual(result["status"], "interrupted")
         self.assertEqual(result["completed_steps"], 0)
         self.assertTrue(result["handoff_saved"])
         self.assertFalse(handoff.call_args.kwargs["use_model"])
+
+    def test_interrupt_while_planning_keeps_existing_handoff_untouched(self):
+        # Обратная сторона того же правила: пригодный handoff.md не перезаписывается
+        # черновиком, а второй запрос к остановленной модели не делается.
+        with tempfile.TemporaryDirectory() as directory:
+            existing = Path(directory) / "handoff.md"
+            existing.write_text(VALID_HANDOFF, encoding="utf-8")
+            with patch.object(loop_team.analyst_planner, "build_execution_plan",
+                              side_effect=KeyboardInterrupt), \
+                    patch.object(loop_team, "_handoff_file_path",
+                                 return_value=existing), \
+                    patch.object(loop_team.handoff_manager, "generate_handoff") as generate:
+                result = loop_team.run_team_loop("Новая задача")
+                saved_text = existing.read_text(encoding="utf-8")
+
+        generate.assert_not_called()
+        self.assertEqual(result["status"], "interrupted")
+        self.assertTrue(result["handoff_saved"])
+        self.assertEqual(saved_text, VALID_HANDOFF)
 
     def test_interrupt_during_plan_preserves_existing_handoff(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -28,6 +28,22 @@ VALID_HANDOFF = (
 )
 
 
+class TestArgumentRules(unittest.TestCase):
+    """Точка входа больше не ссорит --resume и текст: текст = уточнение."""
+
+    def test_resume_with_text_is_allowed(self):
+        self.assertEqual(
+            entry._check_arguments("Продолжи выполнение задачи", True), ""
+        )
+
+    def test_new_task_without_text_is_rejected(self):
+        self.assertIn("не передан текст задачи",
+                      entry._check_arguments("", False))
+
+    def test_resume_without_text_is_allowed(self):
+        self.assertEqual(entry._check_arguments("", True), "")
+
+
 class TestResumeFallback(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -225,8 +241,8 @@ class TestStressHandoffValidation(unittest.TestCase):
         with redirect_stdout(output):
             entry._print_summary(result)
 
+        self.assertIn("start_team.py", output.getvalue())
         self.assertIn("Move-Item", output.getvalue())
-        self.assertIn("может продолжить старый план", output.getvalue())
 
 
 if __name__ == "__main__":

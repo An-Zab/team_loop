@@ -2,7 +2,6 @@
 """Тесты для team_config.py (ШАГ 1)."""
 
 import io
-import math
 import os
 import shutil
 import sys
@@ -158,6 +157,13 @@ class TestTokenCalculations(unittest.TestCase):
         self.assertTrue(tc.is_context_critical(limit))
         self.assertTrue(tc.is_context_critical(limit + 1))
 
+    def test_is_context_critical_fires_at_sixty_percent(self):
+        # Правило чистого чата: 60 % контекста и больше — обязателен Handoff.
+        maximum = tc.MAX_CONTEXT_TOKENS
+        self.assertTrue(tc.is_context_critical(int(maximum * 0.60)))
+        self.assertFalse(tc.is_context_critical(int(maximum * 0.60) - 1))
+        self.assertTrue(tc.is_context_critical(maximum))
+
     def test_is_context_critical_runtime_clamp(self):
         saved = tc.HANDOFF_TOKEN_LIMIT
         try:
@@ -178,14 +184,25 @@ class TestConfigBounds(unittest.TestCase):
     """Тестирование диапазонов и дефолтов конфигурации."""
 
     def test_max_context_tokens_bounds(self):
+        # Проверяем инвариант, а не конкретное число: потолок настройки живёт в
+        # team_config и может быть поднят под окно конкретной модели.
         self.assertGreaterEqual(tc.MAX_CONTEXT_TOKENS, 1)
-        self.assertLessEqual(tc.MAX_CONTEXT_TOKENS, 131072)
+        self.assertLessEqual(tc.MAX_CONTEXT_TOKENS, tc._MAX_ALLOWED_CONTEXT_TOKENS)
 
-    def test_handoff_free_ratio_bounds(self):
-        self.assertGreater(tc.HANDOFF_FREE_RATIO, 0.0)
-        self.assertLess(tc.HANDOFF_FREE_RATIO, 1.0)
-        self.assertFalse(math.isnan(tc.HANDOFF_FREE_RATIO))
-        self.assertFalse(math.isinf(tc.HANDOFF_FREE_RATIO))
+    def test_handoff_trigger_ratio_is_sixty_percent(self):
+        self.assertEqual(tc.HANDOFF_TRIGGER_RATIO, 0.60)
+
+    def test_handoff_token_limit_is_derived_from_max_context(self):
+        # Порог больше не настраивается отдельно: он всегда 60 % от окна модели.
+        self.assertEqual(
+            tc.HANDOFF_TOKEN_LIMIT, int(tc.MAX_CONTEXT_TOKENS * tc.HANDOFF_TRIGGER_RATIO)
+        )
+
+    def test_context_fill_percent_counts_the_real_window(self):
+        maximum = tc.MAX_CONTEXT_TOKENS
+        self.assertAlmostEqual(tc.context_fill_percent(maximum), 100.0)
+        self.assertAlmostEqual(tc.context_fill_percent(maximum // 2), 50.0)
+        self.assertEqual(tc.context_fill_percent("не число"), 0.0)
 
     def test_handoff_token_limit_bounds(self):
         self.assertGreaterEqual(tc.HANDOFF_TOKEN_LIMIT, 1)
